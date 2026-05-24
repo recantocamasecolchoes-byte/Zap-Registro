@@ -1,0 +1,6 @@
+{
+  "name": "IA Zap Registro",
+  "description": "Gestão inteligente de pedidos WhatsApp para vendas de móveis e direto da fábrica.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

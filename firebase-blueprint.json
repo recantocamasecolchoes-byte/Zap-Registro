@@ -1,0 +1,98 @@
+{
+  "entities": {
+    "pedido": {
+      "title": "Pedido",
+      "description": "Ficha de pedido de móveis interpretada via WhatsApp",
+      "type": "object",
+      "properties": {
+        "numeroVenda": {
+          "type": "string",
+          "description": "Número sequencial ou identificador do pedido"
+        },
+        "data": {
+          "type": "string",
+          "description": "Data do pedido formatada (ex: 04/05)"
+        },
+        "nomeCompleto": {
+          "type": "string",
+          "description": "Nome completo do cliente"
+        },
+        "telefone1": {
+          "type": "string",
+          "description": "Telefone principal de contato"
+        },
+        "telefone2": {
+          "type": "string",
+          "description": "Telefone secundário de contato"
+        },
+        "endereco": {
+          "type": "string",
+          "description": "Endereço completo para entrega"
+        },
+        "produto": {
+          "type": "string",
+          "description": "Nome do produto/móvel"
+        },
+        "cor": {
+          "type": "string",
+          "description": "Cor ou acabamento do móvel"
+        },
+        "quantidade": {
+          "type": "integer",
+          "description": "Quantidade comprada"
+        },
+        "formaPagamento": {
+          "type": "string",
+          "description": "Forma de pagamento (Dinheiro, Pix, Cartão, etc.)"
+        },
+        "valorTotal": {
+          "type": "number",
+          "description": "Preço total cobrado do cliente em R$"
+        },
+        "comissao": {
+          "type": "number",
+          "description": "Valor da comissão a receber em R$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["Pendente", "Agendado", "Entregue"],
+          "description": "Situação do pedido"
+        },
+        "textoOriginal": {
+          "type": "string",
+          "description": "Ficha original inteira copiada do WhatsApp"
+        },
+        "observacoes": {
+          "type": "string",
+          "description": "Observações adicionais extraídas ou digitadas"
+        },
+        "userId": {
+          "type": "string",
+          "description": "ID do usuário do Firebase correspondente"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "nomeCompleto",
+        "produto",
+        "valorTotal",
+        "comissao",
+        "status",
+        "textoOriginal"
+      ]
+    }
+  },
+  "firestore": {
+    "pedidos/{pedidoId}": {
+      "schema": "pedido",
+      "description": "Coleção de pedidos cadastrados por vendedores de móveis"
+    }
+  }
+}
