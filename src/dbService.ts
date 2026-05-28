@@ -138,11 +138,12 @@ export function subscribePedidos(
         
         // Normalize status to uppercase values
         const rawStatus = d.status || 'PENDING';
-        const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' =
+        const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
           (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
           (rawStatus === 'Reagendado' || rawStatus === 'Agendado' || rawStatus === 'RESCHEDULED') ? 'RESCHEDULED' :
           (rawStatus === 'Entregue e Não Pago' || rawStatus === 'DELIVERED_UNPAID' || rawStatus === 'Entregue / N.P.') ? 'DELIVERED_UNPAID' :
-          (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' : 'PENDING';
+          (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
+          (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
 
         list.push({
           id: docSnap.id,
@@ -163,6 +164,7 @@ export function subscribePedidos(
           rescheduleDate: d.rescheduleDate || d.dataReagendamento || '',
           textoOriginal: d.textoOriginal || '',
           observacoes: d.observacoes || '',
+          supplier: d.supplier || 'SOFIA_HOME_DECOR',
           userId: d.userId || '',
           createdAt: d.createdAt?.seconds ? d.createdAt.seconds * 1000 : d.createdAt,
           updatedAt: d.updatedAt?.seconds ? d.updatedAt.seconds * 1000 : d.updatedAt
@@ -200,11 +202,12 @@ export function subscribePedidos(
  */
 export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): Promise<string> {
   const rawStatus = (pedido.status || 'PENDING') as any;
-  const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' =
+  const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
     (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
     (rawStatus === 'Reagendado' || rawStatus === 'Agendado' || rawStatus === 'RESCHEDULED') ? 'RESCHEDULED' :
     (rawStatus === 'Entregue e Não Pago' || rawStatus === 'DELIVERED_UNPAID' || rawStatus === 'Entregue / N.P.') ? 'DELIVERED_UNPAID' :
-    (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' : 'PENDING';
+    (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
+    (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
 
   const payload: any = {
     numeroVenda: pedido.numeroVenda,
@@ -224,6 +227,7 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): 
     rescheduleDate: pedido.rescheduleDate || pedido.dataReagendamento || '',
     textoOriginal: pedido.textoOriginal,
     observacoes: pedido.observacoes,
+    supplier: pedido.supplier || 'SOFIA_HOME_DECOR',
     updatedAt: isFirebaseConfigured ? serverTimestamp() : Date.now()
   };
 
@@ -292,17 +296,19 @@ export async function updatePedidoStatus(
 
   // 2. VALIDAR STATUS ANTES DE SALVAR (and convert to uppercase first)
   const rawStatus = newStatus || 'PENDING';
-  const fileStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' =
+  const fileStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
     (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
     (rawStatus === 'Reagendado' || rawStatus === 'Agendado' || rawStatus === 'RESCHEDULED') ? 'RESCHEDULED' :
     (rawStatus === 'Entregue e Não Pago' || rawStatus === 'DELIVERED_UNPAID' || rawStatus === 'Entregue / N.P.') ? 'DELIVERED_UNPAID' :
-    (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' : 'PENDING';
+    (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
+    (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
 
   const VALID_STATUS = [
     "PENDING",
     "RESCHEDULED",
     "DELIVERED_UNPAID",
-    "DELIVERED"
+    "DELIVERED",
+    "CANCELLED"
   ];
 
   if (!VALID_STATUS.includes(fileStatus)) {

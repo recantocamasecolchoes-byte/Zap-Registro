@@ -12,11 +12,12 @@ export interface Pedido {
   formaPagamento: string;
   valorTotal: number;
   comissao: number;
-  status: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED';
+  status: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED';
   dataReagendamento?: string;
   rescheduleDate?: string;
   textoOriginal: string;
   observacoes: string;
+  supplier?: 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS';
   userId?: string;
   createdAt?: string | number | Date | any;
   updatedAt?: string | number | Date | any;

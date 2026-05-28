@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Plus, 
   Sparkles, 
@@ -21,6 +21,7 @@ import {
   Grid, 
   ArrowLeft, 
   X, 
+  XCircle,
   MoreVertical, 
   Layers, 
   Trash2, 
@@ -72,7 +73,7 @@ export default function App() {
   
   // App UI Views / Form
   const [viewMode, setViewMode] = useState<'dashboard' | 'spreadsheet'>('dashboard');
-  const [currentTab, setCurrentTab] = useState<'ativos' | 'entregues' | 'reagendados'>('ativos');
+  const [currentTab, setCurrentTab] = useState<'ativos' | 'entregues' | 'reagendados' | 'cancelados'>('ativos');
   const [searchQuery, setSearchQuery] = useState('');
   
   // Modals & Active actions
@@ -85,6 +86,36 @@ export default function App() {
   const [showNotificationsDropdown, setShowNotificationsDropdown] = useState<boolean>(false);
   const [showReportsModal, setShowReportsModal] = useState<boolean>(false);
   const [selectedReportPeriod, setSelectedReportPeriod] = useState<'prev_week' | 'all'>('prev_week');
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  const handleCopyText = (text: string, fieldId: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedField(fieldId);
+    setTimeout(() => {
+      setCopiedField(null);
+    }, 1000);
+  };
+
+  // Supplier multi-tabs state
+  const [currentSupplier, setCurrentSupplier] = useState<'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS'>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('iazap_current_supplier');
+      if (saved === 'SOFIA_HOME_DECOR' || saved === 'MICHAEL' || saved === 'FRANK' || saved === 'OUTROS') {
+        return saved;
+      }
+    }
+    return 'SOFIA_HOME_DECOR';
+  });
+
+  // Persist current active supplier
+  useEffect(() => {
+    localStorage.setItem('iazap_current_supplier', currentSupplier);
+  }, [currentSupplier]);
+
+  // Derived filtered orders list for active supplier tab
+  const currentSupplierPedidos = useMemo(() => {
+    return pedidos.filter(p => (p.supplier || 'SOFIA_HOME_DECOR') === currentSupplier);
+  }, [pedidos, currentSupplier]);
 
   // Advanced Filter & Sort states
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>(['Todos']);
@@ -256,7 +287,7 @@ export default function App() {
         // Generate pre-filled structure
         const today = new Date();
         const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-        const nextNum = generateNextNumeroVenda(pedidos);
+        const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
         // Opcionalmente sugerir valor de comissão (10% se não especificado)
         const totalVal = Number(extracted.valorTotal) || 0;
@@ -382,7 +413,7 @@ export default function App() {
       // Construct logical payload
       const payload: Omit<Pedido, "id"> & { id?: string } = {
         id: editingPedido.id,
-        numeroVenda: editingPedido.numeroVenda || generateNextNumeroVenda(pedidos),
+        numeroVenda: editingPedido.numeroVenda || generateNextNumeroVenda(currentSupplierPedidos),
         data: editingPedido.data || new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }),
         nomeCompleto: editingPedido.nomeCompleto,
         telefone1: editingPedido.telefone1 || '',
@@ -398,7 +429,8 @@ export default function App() {
         dataReagendamento: editingPedido.dataReagendamento || '',
         rescheduleDate: editingPedido.rescheduleDate || editingPedido.dataReagendamento || '',
         textoOriginal: editingPedido.textoOriginal || `PEDIDO MANUAL\nCliente: ${editingPedido.nomeCompleto}\nProduto: ${editingPedido.produto}`,
-        observacoes: editingPedido.observacoes || ''
+        observacoes: editingPedido.observacoes || '',
+        supplier: editingPedido.supplier || currentSupplier
       };
 
       await savePedido(payload);
@@ -444,10 +476,15 @@ export default function App() {
       } else if (newStatus === 'DELIVERED') {
         setCurrentTab('entregues');
         triggerToast('success', `Pedido ${updated.numeroVenda} marcado como Entregue e movido para a aba Pedidos Entregues!`);
+      } else if (newStatus === 'CANCELLED') {
+        setCurrentTab('cancelados');
+        setSelectedStatuses(['Todos']);
+        triggerToast('success', `Pedido ${updated.numeroVenda} foi cancelado com sucesso e movido para a aba de Cancelados!`);
       } else {
         const readableLabel = newStatus === 'PENDING' ? 'Pendente' :
                               newStatus === 'RESCHEDULED' ? 'Reagendado / Agendado' :
-                              newStatus === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' : 'Entregue';
+                              newStatus === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
+                              newStatus === 'CANCELLED' ? 'Cancelado' : 'Entregue';
         triggerToast('success', `Pedido ${updated.numeroVenda} atualizado para ${readableLabel}!`);
       }
       setShowDropdownId(null);
@@ -465,7 +502,7 @@ export default function App() {
     const mm = String(today.getMonth() + 1).padStart(2, '0');
     const todayStr = `${dd}/${mm}`;
 
-    return pedidos.map(p => {
+    return currentSupplierPedidos.map(p => {
       if (p.status !== 'RESCHEDULED' && p.status !== 'PENDING') return null;
 
       const targetDate = p.dataReagendamento ? p.dataReagendamento : p.data;
@@ -548,13 +585,15 @@ export default function App() {
       prevWeekDays.push(formatDDMM(temp));
     }
     
-    const prevWeekPedidos = pedidos.filter(p => {
-      if (!p.data) return false;
-      const match = p.data.match(/(\d{2})\/(\d{2})/);
-      if (!match) return false;
-      const itemDDMM = `${match[1]}/${match[2]}`;
-      return prevWeekDays.includes(itemDDMM);
-    });
+    const prevWeekPedidos = currentSupplierPedidos
+      .filter(p => p.status !== 'CANCELLED')
+      .filter(p => {
+        if (!p.data) return false;
+        const match = p.data.match(/(\d{2})\/(\d{2})/);
+        if (!match) return false;
+        const itemDDMM = `${match[1]}/${match[2]}`;
+        return prevWeekDays.includes(itemDDMM);
+      });
     
     let filteredPedidos = prevWeekPedidos;
     let labelPeriodo = periodStr;
@@ -563,7 +602,7 @@ export default function App() {
     if (filteredPedidos.length === 0) {
       wasFallback = true;
       labelPeriodo = "Todos os Lançamentos";
-      filteredPedidos = pedidos;
+      filteredPedidos = currentSupplierPedidos.filter(p => p.status !== 'CANCELLED');
     }
     
     const fatTotal = filteredPedidos.reduce((sum, p) => sum + (p.valorTotal || 0), 0);
@@ -573,7 +612,7 @@ export default function App() {
       .filter(p => p.status === 'DELIVERED')
       .reduce((sum, p) => sum + (p.comissao || 0), 0);
     const totalEntregues = filteredPedidos.filter(p => p.status === 'DELIVERED').length;
-    const totalPendentes = filteredPedidos.filter(p => p.status !== 'DELIVERED').length;
+    const totalPendentes = filteredPedidos.filter(p => p.status !== 'DELIVERED' && p.status !== 'CANCELLED').length;
     
     return {
       periodo: labelPeriodo,
@@ -606,6 +645,8 @@ export default function App() {
       base = "bg-blue-50/15 text-slate-755 hover:bg-blue-50/25";
     } else if (status === 'DELIVERED') {
       base = "bg-emerald-50/15 text-slate-755 hover:bg-emerald-50/25";
+    } else if (status === 'CANCELLED') {
+      base = "bg-red-50/30 text-rose-800 hover:bg-red-100/30 opacity-75";
     } else {
       base = "bg-white text-slate-705 hover:bg-slate-50";
     }
@@ -617,6 +658,8 @@ export default function App() {
         return `${base} border-l-[3.5px] border-blue-400 pl-[12.5px] font-medium bg-blue-50/30`;
       } else if (status === 'DELIVERED') {
         return `${base} border-l-[3.5px] border-emerald-400 pl-[12.5px] font-medium bg-emerald-50/30`;
+      } else if (status === 'CANCELLED') {
+        return `${base} border-l-[3.5px] border-rose-500 pl-[12.5px] font-medium bg-rose-50/35`;
       } else {
         return `${base} border-l-[3.5px] border-brand pl-[12.5px] font-medium bg-slate-50/80`;
       }
@@ -641,6 +684,22 @@ export default function App() {
     }
   };
 
+  // Cancel Order
+  const handleCancelPedido = async (id: string) => {
+    if (window.confirm("Tem certeza que deseja cancelar este pedido?")) {
+      try {
+        await updatePedidoStatus(id, 'CANCELLED');
+        triggerToast('success', 'Pedido cancelado com sucesso!');
+        setSelectedPedido(null);
+        setShowDropdownId(null);
+      } catch (err: any) {
+        console.error(err);
+        const readableError = parseFirebaseError(err);
+        triggerToast('error', `Falha ao cancelar o pedido: ${readableError}`);
+      }
+    }
+  };
+
   // Copy buffers helpers
   const copyToClipboard = (text: string, typeName: string) => {
     navigator.clipboard.writeText(text);
@@ -648,13 +707,17 @@ export default function App() {
   };
 
   // 11. CONTROLE DE COMISSÃO & 12. PAINEL DE RESUMO CALCULATIONS
-  const totalVendidosSum = pedidos.reduce((sum, p) => sum + (p.valorTotal || 0), 0);
-  const totalComissoesSum = pedidos.reduce((sum, p) => sum + (p.comissao || 0), 0);
-  const totalComissoesRecebidas = pedidos
+  const totalVendidosSum = currentSupplierPedidos
+    .filter(p => p.status !== 'CANCELLED')
+    .reduce((sum, p) => sum + (p.valorTotal || 0), 0);
+  const totalComissoesSum = currentSupplierPedidos
+    .filter(p => p.status !== 'CANCELLED')
+    .reduce((sum, p) => sum + (p.comissao || 0), 0);
+  const totalComissoesRecebidas = currentSupplierPedidos
     .filter(p => p.status === 'DELIVERED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
-  const totalComissoesPendentes = pedidos
-    .filter(p => p.status !== 'DELIVERED')
+  const totalComissoesPendentes = currentSupplierPedidos
+    .filter(p => p.status !== 'DELIVERED' && p.status !== 'CANCELLED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
   
   // --- CORE SYSTEM OF ADVANCED FILTRATION, DATE TRACKING & ALPHABETICAL/TEMPORAL SORTING ---
@@ -807,6 +870,8 @@ export default function App() {
       return pedido.status === 'PENDING' || pedido.status === 'DELIVERED_UNPAID';
     } else if (currentTab === 'reagendados') {
       return pedido.status === 'RESCHEDULED';
+    } else if (currentTab === 'cancelados') {
+      return pedido.status === 'CANCELLED';
     } else {
       return pedido.status === 'DELIVERED';
     }
@@ -822,12 +887,13 @@ export default function App() {
       if (selected === 'Reagendados') return p.status === 'RESCHEDULED';
       if (selected === 'Entregue e não pago') return p.status === 'DELIVERED_UNPAID';
       if (selected === 'Entregues') return p.status === 'DELIVERED';
+      if (selected === 'Cancelados') return p.status === 'CANCELLED';
       return false;
     });
   };
 
   // COMPLETED PIPELINE: TEXT SEARCH -> STATUS MATRIX -> DATE PARAMETERS -> SORTING MATRIX (ALPHABETICAL / CRONOLOGICAL)
-  const orderListFiltered = pedidos
+  const orderListFiltered = currentSupplierPedidos
     .filter(matchStatus)
     .filter(p => {
       const query = searchQuery.toLowerCase().trim();
@@ -876,7 +942,7 @@ export default function App() {
   const handleAddNewManualRowSpreadsheet = async () => {
     const today = new Date();
     const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-    const nextNum = generateNextNumeroVenda(pedidos);
+    const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
     const newObj: Omit<Pedido, "id"> = {
       numeroVenda: nextNum,
@@ -893,7 +959,8 @@ export default function App() {
       comissao: 0,
       status: 'PENDING',
       textoOriginal: `PEDIDO MANUAL SEQUENCIAL ${nextNum}`,
-      observacoes: ""
+      observacoes: "",
+      supplier: currentSupplier
     };
 
     try {
@@ -1128,6 +1195,52 @@ export default function App() {
         </div>
       </header>
 
+      {/* SUPPLIER MULTI-ABAS SECTION */}
+      <div className="bg-white border-b border-slate-200 py-3 px-4 sm:px-6 sticky top-[72px] z-30 shadow-2xs">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+            <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 shrink-0">Fornecedor:</span>
+            <div className="flex overflow-x-auto gap-1.5 no-scrollbar scroll-smooth pb-1 sm:pb-0">
+              {[
+                { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' },
+                { id: 'MICHAEL', label: 'Michael' },
+                { id: 'FRANK', label: 'Frank' },
+                { id: 'OUTROS', label: 'Outros Fornecedores' }
+              ].map((sup) => {
+                const count = pedidos.filter(p => (p.supplier || 'SOFIA_HOME_DECOR') === sup.id).length;
+                const isActive = currentSupplier === sup.id;
+                return (
+                  <button
+                    key={sup.id}
+                    id={`supplier-tab-${sup.id}`}
+                    onClick={() => {
+                      setCurrentSupplier(sup.id as any);
+                      setSelectedPedido(null);
+                    }}
+                    className={`py-1.5 px-3.5 rounded-full text-xs font-extrabold transition whitespace-nowrap flex items-center gap-1.5 cursor-pointer shrink-0 select-none ${
+                      isActive 
+                        ? 'bg-blue-600 text-white shadow-xs' 
+                        : 'bg-slate-100 hover:bg-slate-200/80 text-slate-600'
+                    }`}
+                  >
+                    <span>{sup.label}</span>
+                    <span className={`text-[9px] px-1.5 py-0.2 rounded-full font-bold ${
+                      isActive ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-500'
+                    }`}>
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="text-[10px] text-slate-405 font-bold self-start sm:self-center uppercase tracking-wider hidden sm:block">
+            Sessão Ativa: <span className="text-blue-600 font-extrabold">{currentSupplier === 'SOFIA_HOME_DECOR' ? 'Sofia Home Decor' : currentSupplier === 'MICHAEL' ? 'Michael' : currentSupplier === 'FRANK' ? 'Frank' : 'Outros'}</span>
+          </div>
+        </div>
+      </div>
+
       {/* RENDER VIEWMODE 1: DASHBOARD MAIN SCREEN */}
       {viewMode === 'dashboard' ? (
         <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-6">
@@ -1175,7 +1288,7 @@ export default function App() {
                 <button
                   id="btn-create-manual-fallback"
                   onClick={() => {
-                    const nextNum = generateNextNumeroVenda(pedidos);
+                    const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
                     setEditingPedido({
                       numeroVenda: nextNum,
                       data: new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }),
@@ -1191,7 +1304,8 @@ export default function App() {
                       comissao: 0,
                       status: 'PENDING',
                       textoOriginal: 'Ficha Cadastrada Manualmente',
-                      observacoes: ''
+                      observacoes: '',
+                      supplier: currentSupplier
                     });
                   }}
                   className="bg-white border border-slate-200 hover:border-slate-300 text-slate-700 hover:bg-slate-50 text-xs py-2.5 px-4.5 rounded-full font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
@@ -1465,6 +1579,7 @@ export default function App() {
                           <option value="RESCHEDULED">Reagendado / Agendado</option>
                           <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
                           <option value="DELIVERED">Entregue</option>
+                          <option value="CANCELLED">❌ Cancelado</option>
                         </select>
                       </div>
 
@@ -1525,7 +1640,7 @@ export default function App() {
             <div className="bg-white rounded-3xl p-6 shadow-sm hover:shadow-md border border-slate-200/80 hover:border-brand/30 transition flex items-center justify-between group">
               <div>
                 <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Total de Vendas</span>
-                <span className="text-2xl sm:text-3xl font-bold text-slate-900 mt-1 block font-sans tracking-tight">{pedidos.length}</span>
+                <span className="text-2xl sm:text-3xl font-bold text-slate-900 mt-1 block font-sans tracking-tight">{currentSupplierPedidos.length}</span>
               </div>
               <div className="bg-brand/10 text-brand p-3 rounded-2xl group-hover:scale-110 transition duration-300">
                 <FileText className="w-5 h-5" />
@@ -1669,7 +1784,7 @@ export default function App() {
                       }`}
                     >
                       <Clock className="w-3.5 h-3.5" />
-                      Ativos ({pedidos.filter(p => p.status === 'PENDING' || p.status === 'DELIVERED_UNPAID').length})
+                      Ativos ({currentSupplierPedidos.filter(p => p.status === 'PENDING' || p.status === 'DELIVERED_UNPAID').length})
                     </button>
                     <button
                       id="tab-reagendados"
@@ -1684,7 +1799,7 @@ export default function App() {
                       }`}
                     >
                       <Calendar className="w-3.5 h-3.5" />
-                      Notas Agendadas ({pedidos.filter(p => p.status === 'RESCHEDULED').length})
+                      Notas Agendadas ({currentSupplierPedidos.filter(p => p.status === 'RESCHEDULED').length})
                     </button>
                     <button
                       id="tab-entregues"
@@ -1699,7 +1814,22 @@ export default function App() {
                       }`}
                     >
                       <CheckCircle className="w-3.5 h-3.5" />
-                      Entregues ({pedidos.filter(p => p.status === 'DELIVERED').length})
+                      Entregues ({currentSupplierPedidos.filter(p => p.status === 'DELIVERED').length})
+                    </button>
+                    <button
+                      id="tab-cancelados"
+                      onClick={() => {
+                        setCurrentTab('cancelados');
+                        setSelectedStatuses(['Todos']);
+                      }}
+                      className={`px-4 sm:px-6 py-1.5 rounded-full text-xs font-extrabold transition flex items-center gap-1.5 cursor-pointer select-none ${
+                        currentTab === 'cancelados' 
+                          ? 'bg-rose-600 text-white shadow-xs' 
+                          : 'text-slate-500 hover:text-brand animate-pulse-subtle'
+                      }`}
+                    >
+                      <XCircle className="w-3.5 h-3.5" />
+                      Cancelados ({currentSupplierPedidos.filter(p => p.status === 'CANCELLED').length})
                     </button>
                   </div>
 
@@ -1756,7 +1886,8 @@ export default function App() {
                         { key: 'Pendentes', label: 'Pendentes' },
                         { key: 'Reagendados', label: 'Notas Agendadas / Pedidos Reagendados' },
                         { key: 'Entregue e não pago', label: 'Entregue e Não Pago' },
-                        { key: 'Entregues', label: 'Entregues' }
+                        { key: 'Entregues', label: 'Entregues' },
+                        { key: 'Cancelados', label: '❌ Cancelados' }
                       ].map(item => {
                         const active = selectedStatuses.includes(item.key);
                         return (
@@ -1947,6 +2078,7 @@ export default function App() {
                               pedido.status === 'PENDING' ? 'bg-amber-50 text-amber-850 border-amber-300' :
                               pedido.status === 'RESCHEDULED' ? 'bg-yellow-50 text-amber-950 border-yellow-300' :
                               pedido.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-900 border-blue-300' :
+                              pedido.status === 'CANCELLED' ? 'bg-rose-50 text-rose-700 border-rose-300' :
                               'bg-emerald-50 text-emerald-950 border-emerald-300'
                             }`}
                           >
@@ -1954,6 +2086,7 @@ export default function App() {
                             <option value="RESCHEDULED">Reagendado / Agendado</option>
                             <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
                             <option value="DELIVERED">Entregue</option>
+                            <option value="CANCELLED">❌ Cancelado</option>
                           </select>
                           {pedido.status === 'RESCHEDULED' && (pedido.dataReagendamento || pedido.rescheduleDate) && (
                             <div className="text-[9px] text-amber-900 font-extrabold flex items-center justify-center gap-1 mt-1 font-sans">
@@ -2046,13 +2179,13 @@ export default function App() {
                     <th className="px-3 py-3.5 w-32 text-right">Valor Célula (R$)</th>
                     <th className="px-3 py-3.5 w-32 text-right">Comissão (R$)</th>
                     <th className="px-3 py-3.5 w-36 text-center">Status</th>
-                    <th className="px-3 py-3.5 w-16 text-center">Lixo</th>
+                    <th className="px-3 py-3.5 w-20 text-center text-rose-650">Cancelar</th>
                   </tr>
                 </thead>
 
                 <tbody className="divide-y divide-natural-border/50 font-mono">
-                  {pedidos.length > 0 ? (
-                    pedidos.map((p) => (
+                  {currentSupplierPedidos.length > 0 ? (
+                    currentSupplierPedidos.map((p) => (
                       <tr key={p.id} className="hover:bg-slate-50/50 transition">
                         
                         {/* Numero */}
@@ -2165,7 +2298,8 @@ export default function App() {
                               } else {
                                 await updatePedidoStatus(p.id, nextStat);
                                 const readable = nextStat === 'PENDING' ? 'Pendente' :
-                                                 nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' : 'Entregue';
+                                                 nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
+                                                 nextStat === 'CANCELLED' ? 'Cancelado' : 'Entregue';
                                 triggerToast('success', `Status alterado na planilha: ${readable}`);
                               }
                             }}
@@ -2173,6 +2307,7 @@ export default function App() {
                               p.status === 'PENDING' ? 'bg-amber-50 text-amber-700' :
                               p.status === 'RESCHEDULED' ? 'bg-orange-50/75 text-orange-950' :
                               p.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-700' :
+                              p.status === 'CANCELLED' ? 'bg-red-50 text-rose-800' :
                               'bg-emerald-50 text-emerald-700'
                             }`}
                           >
@@ -2180,17 +2315,18 @@ export default function App() {
                             <option value="RESCHEDULED">Reagendado / Agendado</option>
                             <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
                             <option value="DELIVERED">Entregue</option>
+                            <option value="CANCELLED">❌ Cancelado</option>
                           </select>
                         </td>
 
-                        {/* Excluir */}
+                        {/* Cancelar */}
                         <td className="px-2 py-2 text-center">
                           <button 
-                            onClick={() => handleDeletePedido(p.id)}
-                            className="p-1 hover:bg-red-50 text-red-500 rounded transition cursor-pointer"
-                            title="Remover linha"
+                            onClick={() => handleCancelPedido(p.id)}
+                            className="p-1 hover:bg-rose-50 text-rose-500 rounded transition cursor-pointer"
+                            title="Cancelar Pedido"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <XCircle className="w-3.5 h-3.5" />
                           </button>
                         </td>
 
@@ -2244,13 +2380,16 @@ export default function App() {
                     selectedPedido.status === 'PENDING' ? 'bg-amber-500/20 text-amber-250' :
                     selectedPedido.status === 'RESCHEDULED' ? 'bg-yellow-500/25 text-yellow-200 border border-yellow-300/40' :
                     selectedPedido.status === 'DELIVERED_UNPAID' ? 'bg-blue-500/20 text-blue-200' :
+                    selectedPedido.status === 'CANCELLED' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30 font-extrabold' :
                     'bg-emerald-500/20 text-emerald-200'
                   }`}>
                     {selectedPedido.status === 'RESCHEDULED' && <Calendar className="w-3.5 h-3.5 shrink-0" />}
+                    {selectedPedido.status === 'CANCELLED' && <XCircle className="w-3.5 h-3.5 shrink-0" />}
                     <span>
                       {selectedPedido.status === 'PENDING' ? 'Pendente' :
                        selectedPedido.status === 'RESCHEDULED' ? `Reagendado ${selectedPedido.dataReagendamento ? `(${selectedPedido.dataReagendamento})` : ''}` :
-                       selectedPedido.status === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' : 'Entregue'}
+                       selectedPedido.status === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
+                       selectedPedido.status === 'CANCELLED' ? 'Cancelado' : 'Entregue'}
                     </span>
                   </span>
                   <button 
@@ -2271,9 +2410,31 @@ export default function App() {
                   {/* Name and product */}
                   <div className="space-y-4">
                     
-                    <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
-                      <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wide">Comprador</span>
-                      <p className="text-sm font-semibold text-slate-800 mt-0.5">{selectedPedido.nomeCompleto}</p>
+                    <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80 flex items-center justify-between">
+                      <div>
+                        <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wide block">Comprador</span>
+                        <p className="text-sm font-semibold text-slate-800 mt-0.5">{selectedPedido.nomeCompleto}</p>
+                      </div>
+                      <button
+                        onClick={() => handleCopyText(selectedPedido.nomeCompleto, 'nomeCompleto')}
+                        className={`p-1.5 rounded-lg flex items-center gap-1 transition text-xs font-bold cursor-pointer select-none shrink-0 border ${
+                          copiedField === 'nomeCompleto'
+                            ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
+                            : 'bg-white hover:bg-slate-100/80 hover:border-slate-350 text-slate-400 hover:text-slate-600 border-slate-200'
+                        }`}
+                        title="Copiar Nome"
+                      >
+                        {copiedField === 'nomeCompleto' ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-600" />
+                            <span className="text-[10px]">Copiado!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                          </>
+                        )}
+                      </button>
                     </div>
 
                     <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
@@ -2282,7 +2443,7 @@ export default function App() {
                         {selectedPedido.produto} 
                         {selectedPedido.cor && <span className="text-slate-400 font-normal"> ({selectedPedido.cor})</span>}
                       </p>
-                      <p className="text-xs text-slate-505 mt-1">Quantidade: {selectedPedido.quantidade}</p>
+                      <p className="text-xs text-slate-550 mt-1">Quantidade: {selectedPedido.quantidade}</p>
                     </div>
 
                   </div>
@@ -2321,23 +2482,71 @@ export default function App() {
                   
                   {/* Fones */}
                   <div className="flex flex-col sm:flex-row gap-4">
-                    <div className="flex-1 flex items-center gap-2 bg-slate-50 py-2 px-3 rounded-2xl border border-slate-200/80">
-                      <Phone className="w-4 h-4 text-brand" />
-                      <div>
-                        <span className="text-[9px] font-sans font-extrabold text-slate-500 uppercase tracking-wider block">Telefone 1 (WhatsApp)</span>
-                        <a href={`https://wa.me/${selectedPedido.telefone1.replace(/\D/g, '')}`} target="_blank" referrerPolicy="no-referrer" rel="noopener noreferrer" className="text-xs font-bold text-brand hover:text-brand-hover underline flex items-center gap-1">
-                          {selectedPedido.telefone1 || 'Não informado'}
-                          {selectedPedido.telefone1 && <ExternalLink className="w-3 h-3"/>}
-                        </a>
+                    <div className="flex-1 flex items-center justify-between gap-2 bg-slate-50 py-2 px-3 rounded-2xl border border-slate-200/80">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Phone className="w-4 h-4 text-brand shrink-0" />
+                        <div className="min-w-0">
+                          <span className="text-[9px] font-sans font-extrabold text-slate-500 uppercase tracking-wider block">Telefone 1 (WhatsApp)</span>
+                          <a href={`https://wa.me/${selectedPedido.telefone1.replace(/\D/g, '')}`} target="_blank" referrerPolicy="no-referrer" rel="noopener noreferrer" className="text-xs font-bold text-brand hover:text-brand-hover underline flex items-center gap-0.5 truncate max-w-full">
+                            {selectedPedido.telefone1 || 'Não informado'}
+                            {selectedPedido.telefone1 && <ExternalLink className="w-3 h-3 shrink-0"/>}
+                          </a>
+                        </div>
                       </div>
+                      {selectedPedido.telefone1 && (
+                        <button
+                          onClick={() => handleCopyText(selectedPedido.telefone1.replace(/\D/g, ''), 'telefone1')}
+                          className={`p-1.5 rounded-lg flex items-center gap-1 transition text-xs font-bold cursor-pointer select-none shrink-0 border ${
+                            copiedField === 'telefone1'
+                              ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
+                              : 'bg-white hover:bg-slate-100/80 hover:border-slate-350 text-slate-400 hover:text-slate-600 border-slate-200'
+                          }`}
+                          title="Copiar WhatsApp (Apenas números)"
+                        >
+                          {copiedField === 'telefone1' ? (
+                            <>
+                              <Check className="w-3 h-3 text-emerald-600" />
+                              <span className="text-[10px]">Copiado!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                            </>
+                          )}
+                        </button>
+                      )}
                     </div>
 
-                    <div className="flex-1 flex items-center gap-2 bg-slate-50 py-2 px-3 rounded-2xl border border-slate-200/80">
-                      <Phone className="w-4 h-4 text-slate-400" />
-                      <div>
-                        <span className="text-[9px] font-sans font-extrabold text-slate-500 uppercase tracking-wider block">Telefone 2</span>
-                        <span className="text-xs font-semibold text-slate-700">{selectedPedido.telefone2 || 'Nenhum secundário'}</span>
+                    <div className="flex-1 flex items-center justify-between gap-2 bg-slate-50 py-2 px-3 rounded-2xl border border-slate-200/80">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Phone className="w-4 h-4 text-slate-400 shrink-0" />
+                        <div className="min-w-0">
+                          <span className="text-[9px] font-sans font-extrabold text-slate-500 uppercase tracking-wider block">Telefone 2</span>
+                          <span className="text-xs font-semibold text-slate-700 block truncate max-w-full">{selectedPedido.telefone2 || 'Nenhum secundário'}</span>
+                        </div>
                       </div>
+                      {selectedPedido.telefone2 && (
+                        <button
+                          onClick={() => handleCopyText(selectedPedido.telefone2.replace(/\D/g, ''), 'telefone2')}
+                          className={`p-1.5 rounded-lg flex items-center gap-1 transition text-xs font-bold cursor-pointer select-none shrink-0 border ${
+                            copiedField === 'telefone2'
+                              ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
+                              : 'bg-white hover:bg-slate-100/80 hover:border-slate-350 text-slate-400 hover:text-slate-600 border-slate-200'
+                          }`}
+                          title="Copiar Telefone 2 (Apenas números)"
+                        >
+                          {copiedField === 'telefone2' ? (
+                            <>
+                              <Check className="w-3 h-3 text-emerald-600" />
+                              <span className="text-[10px]">Copiado!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                            </>
+                          )}
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -2414,13 +2623,16 @@ export default function App() {
                     Ajustar
                   </button>
                   
-                  <button 
-                    onClick={() => handleDeletePedido(selectedPedido.id)}
-                    className="bg-red-50 hover:bg-red-100 text-red-650 text-xs py-2 px-3 rounded-full font-semibold transition cursor-pointer"
-                    title="Remover pedido permanentemente"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                  {selectedPedido.status !== 'CANCELLED' && (
+                    <button 
+                      onClick={() => handleCancelPedido(selectedPedido.id)}
+                      className="bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-xs py-2 px-3.5 rounded-full font-bold transition flex items-center gap-1.5 cursor-pointer"
+                      title="Cancelar Pedido"
+                    >
+                      <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                      Cancelar Pedido
+                    </button>
+                  )}
 
                   <button
                     onClick={() => setSelectedPedido(null)}
