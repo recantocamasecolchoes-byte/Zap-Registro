@@ -34,7 +34,8 @@ import {
   BarChart3,
   SlidersHorizontal,
   ArrowUpDown,
-  Filter
+  Filter,
+  Eye
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Pedido } from './types';
@@ -71,7 +72,7 @@ export default function App() {
   
   // App UI Views / Form
   const [viewMode, setViewMode] = useState<'dashboard' | 'spreadsheet'>('dashboard');
-  const [currentTab, setCurrentTab] = useState<'ativos' | 'entregues'>('ativos');
+  const [currentTab, setCurrentTab] = useState<'ativos' | 'entregues' | 'reagendados'>('ativos');
   const [searchQuery, setSearchQuery] = useState('');
   
   // Modals & Active actions
@@ -277,7 +278,7 @@ export default function App() {
           formaPagamento: extracted.formaPagamento || '',
           valorTotal: totalVal,
           comissao: finalComis,
-          status: 'Pendente',
+          status: 'PENDING',
           textoOriginal: pasteOrderText, // Armazena texto original completo com observações, CNPJ, etc.
           observacoes: extracted.observacoes || ''
         });
@@ -305,7 +306,7 @@ export default function App() {
     try {
       // Filter active orders to optimize context payload and costs
       const activeOrders = pedidos
-        .filter(p => p.status !== 'Entregue')
+        .filter(p => p.status !== 'DELIVERED')
         .map(p => ({
           id: p.id,
           nomeCompleto: p.nomeCompleto,
@@ -338,7 +339,7 @@ export default function App() {
         const index = pedidos.find(p => p.id === matchedId);
         
         if (index) {
-          await updatePedidoStatus(matchedId, 'Entregue');
+          await updatePedidoStatus(matchedId, 'DELIVERED');
           triggerToast('success', `Confirmado! Pedido ${index.numeroVenda} (${index.nomeCompleto}) marcado como Entregue via IA.`);
           setPasteDeliveryText('');
         } else {
@@ -393,7 +394,9 @@ export default function App() {
         formaPagamento: editingPedido.formaPagamento || '',
         valorTotal: Number(editingPedido.valorTotal),
         comissao: Number(editingPedido.comissao),
-        status: editingPedido.status || 'Pendente',
+        status: editingPedido.status || 'PENDING',
+        dataReagendamento: editingPedido.dataReagendamento || '',
+        rescheduleDate: editingPedido.rescheduleDate || editingPedido.dataReagendamento || '',
         textoOriginal: editingPedido.textoOriginal || `PEDIDO MANUAL\nCliente: ${editingPedido.nomeCompleto}\nProduto: ${editingPedido.produto}`,
         observacoes: editingPedido.observacoes || ''
       };
@@ -417,7 +420,7 @@ export default function App() {
     const updated = pedidos.find(p => p.id === id);
     if (!updated) return;
 
-    if (newStatus === 'Reagendado' && (!extra || !extra.dataReagendamento)) {
+    if (newStatus === 'RESCHEDULED' && (!extra || !extra.dataReagendamento)) {
       setReschedulingPedido(updated);
       const today = new Date();
       const dd = String(today.getDate()).padStart(2, '0');
@@ -428,12 +431,24 @@ export default function App() {
     }
 
     try {
+      if (newStatus === 'RESCHEDULED' && extra) {
+        console.log("Pedido reagendado:", id);
+        console.log("Novo status:", "RESCHEDULED");
+        console.log("Nova data:", extra.dataReagendamento);
+      }
       await updatePedidoStatus(id, newStatus, extra);
-      if (newStatus === 'Entregue') {
+      if (newStatus === 'RESCHEDULED') {
+        setCurrentTab('reagendados');
+        setSelectedStatuses(['Todos']);
+        triggerToast('success', `Pedido ${updated.numeroVenda} reagendado para ${extra?.dataReagendamento || ''} e movido para Notas Agendadas!`);
+      } else if (newStatus === 'DELIVERED') {
         setCurrentTab('entregues');
         triggerToast('success', `Pedido ${updated.numeroVenda} marcado como Entregue e movido para a aba Pedidos Entregues!`);
       } else {
-        triggerToast('success', `Pedido ${updated.numeroVenda} atualizado para ${newStatus}!`);
+        const readableLabel = newStatus === 'PENDING' ? 'Pendente' :
+                              newStatus === 'RESCHEDULED' ? 'Reagendado / Agendado' :
+                              newStatus === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' : 'Entregue';
+        triggerToast('success', `Pedido ${updated.numeroVenda} atualizado para ${readableLabel}!`);
       }
       setShowDropdownId(null);
     } catch (err: any) {
@@ -451,9 +466,9 @@ export default function App() {
     const todayStr = `${dd}/${mm}`;
 
     return pedidos.map(p => {
-      if (p.status !== 'Agendado' && p.status !== 'Reagendado' && p.status !== 'Pendente') return null;
+      if (p.status !== 'RESCHEDULED' && p.status !== 'PENDING') return null;
 
-      const targetDate = p.status === 'Reagendado' ? p.dataReagendamento : p.data;
+      const targetDate = p.dataReagendamento ? p.dataReagendamento : p.data;
       if (!targetDate) return null;
 
       const cleanTarget = targetDate.trim().replace(/\s/g, '');
@@ -466,13 +481,13 @@ export default function App() {
         let colorClass = 'border-l-blue-500 bg-blue-50/40';
         let priority: 'high' | 'medium' | 'low' = 'low';
 
-        if (p.status === 'Reagendado') {
+        if (p.dataReagendamento) {
           type = 'rescheduled';
           label = `⏰ Pedido reagendado vence hoje:\n${p.nomeCompleto}`;
           icon = '⏰';
           colorClass = 'border-l-rose-500 bg-rose-50/20';
           priority = 'high';
-        } else if (p.status === 'Agendado') {
+        } else if (p.status === 'RESCHEDULED') {
           type = 'scheduled';
           label = `🚚 Pedido agendado para hoje:\n${p.nomeCompleto} - ${p.produto}`;
           icon = '🚚';
@@ -555,10 +570,10 @@ export default function App() {
     const totalVendas = filteredPedidos.length;
     const comGerada = filteredPedidos.reduce((sum, p) => sum + (p.comissao || 0), 0);
     const comRecebida = filteredPedidos
-      .filter(p => p.status === 'Entregue')
+      .filter(p => p.status === 'DELIVERED')
       .reduce((sum, p) => sum + (p.comissao || 0), 0);
-    const totalEntregues = filteredPedidos.filter(p => p.status === 'Entregue').length;
-    const totalPendentes = filteredPedidos.filter(p => p.status !== 'Entregue').length;
+    const totalEntregues = filteredPedidos.filter(p => p.status === 'DELIVERED').length;
+    const totalPendentes = filteredPedidos.filter(p => p.status !== 'DELIVERED').length;
     
     return {
       periodo: labelPeriodo,
@@ -583,24 +598,24 @@ export default function App() {
       return "bg-amber-100 ring-2 ring-amber-500 scale-[1.01] shadow-md border-l-4 border-amber-600 pl-3 transition-all duration-300 font-bold text-slate-900";
     }
 
-    let base = "bg-white text-slate-750 hover:bg-slate-50";
+    let base = "bg-white text-slate-755 hover:bg-slate-50";
     
-    if (status === 'Reagendado' || status === 'Agendado') {
-      base = "bg-amber-50/15 text-slate-750 hover:bg-amber-50/25";
-    } else if (status === 'Entregue e Não Pago') {
-      base = "bg-blue-50/15 text-slate-750 hover:bg-blue-50/25";
-    } else if (status === 'Entregue') {
+    if (status === 'RESCHEDULED') {
+      base = "bg-amber-50/60 text-amber-950 hover:bg-amber-100/50";
+    } else if (status === 'DELIVERED_UNPAID') {
+      base = "bg-blue-50/15 text-slate-755 hover:bg-blue-50/25";
+    } else if (status === 'DELIVERED') {
       base = "bg-emerald-50/15 text-slate-755 hover:bg-emerald-50/25";
     } else {
       base = "bg-white text-slate-705 hover:bg-slate-50";
     }
     
     if (isSelected) {
-      if (status === 'Reagendado' || status === 'Agendado') {
-        return `${base} border-l-[3.5px] border-amber-400 pl-[12.5px] font-medium bg-amber-50/30`;
-      } else if (status === 'Entregue e Não Pago') {
+      if (status === 'RESCHEDULED') {
+        return `${base} border-l-[3.5px] border-amber-500 pl-[12.5px] font-semibold bg-amber-50/80`;
+      } else if (status === 'DELIVERED_UNPAID') {
         return `${base} border-l-[3.5px] border-blue-400 pl-[12.5px] font-medium bg-blue-50/30`;
-      } else if (status === 'Entregue') {
+      } else if (status === 'DELIVERED') {
         return `${base} border-l-[3.5px] border-emerald-400 pl-[12.5px] font-medium bg-emerald-50/30`;
       } else {
         return `${base} border-l-[3.5px] border-brand pl-[12.5px] font-medium bg-slate-50/80`;
@@ -636,10 +651,10 @@ export default function App() {
   const totalVendidosSum = pedidos.reduce((sum, p) => sum + (p.valorTotal || 0), 0);
   const totalComissoesSum = pedidos.reduce((sum, p) => sum + (p.comissao || 0), 0);
   const totalComissoesRecebidas = pedidos
-    .filter(p => p.status === 'Entregue')
+    .filter(p => p.status === 'DELIVERED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
   const totalComissoesPendentes = pedidos
-    .filter(p => p.status !== 'Entregue')
+    .filter(p => p.status !== 'DELIVERED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
   
   // --- CORE SYSTEM OF ADVANCED FILTRATION, DATE TRACKING & ALPHABETICAL/TEMPORAL SORTING ---
@@ -789,9 +804,11 @@ export default function App() {
   // Tab filtered orders (Active vs Entregues) - Tab state acts as top filter context if specific status not set
   const tabFilterState = (pedido: Pedido) => {
     if (currentTab === 'ativos') {
-      return pedido.status === 'Pendente' || pedido.status === 'Agendado' || pedido.status === 'Reagendado';
+      return pedido.status === 'PENDING' || pedido.status === 'DELIVERED_UNPAID';
+    } else if (currentTab === 'reagendados') {
+      return pedido.status === 'RESCHEDULED';
     } else {
-      return pedido.status === 'Entregue' || pedido.status === 'Entregue e Não Pago';
+      return pedido.status === 'DELIVERED';
     }
   };
 
@@ -801,10 +818,10 @@ export default function App() {
       return tabFilterState(p);
     }
     return selectedStatuses.some(selected => {
-      if (selected === 'Pendentes') return p.status === 'Pendente';
-      if (selected === 'Reagendados') return p.status === 'Reagendado' || p.status === 'Agendado';
-      if (selected === 'Entregue e não pago') return p.status === 'Entregue e Não Pago';
-      if (selected === 'Entregues') return p.status === 'Entregue';
+      if (selected === 'Pendentes') return p.status === 'PENDING';
+      if (selected === 'Reagendados') return p.status === 'RESCHEDULED';
+      if (selected === 'Entregue e não pago') return p.status === 'DELIVERED_UNPAID';
+      if (selected === 'Entregues') return p.status === 'DELIVERED';
       return false;
     });
   };
@@ -874,7 +891,7 @@ export default function App() {
       formaPagamento: "A combinar",
       valorTotal: 0,
       comissao: 0,
-      status: 'Pendente',
+      status: 'PENDING',
       textoOriginal: `PEDIDO MANUAL SEQUENCIAL ${nextNum}`,
       observacoes: ""
     };
@@ -1172,7 +1189,7 @@ export default function App() {
                       formaPagamento: 'PIX',
                       valorTotal: 0,
                       comissao: 0,
-                      status: 'Pendente',
+                      status: 'PENDING',
                       textoOriginal: 'Ficha Cadastrada Manualmente',
                       observacoes: ''
                     });
@@ -1440,13 +1457,14 @@ export default function App() {
                       <div className="col-span-2 sm:col-span-1">
                         <label className="block text-xs font-bold text-natural-text uppercase mb-1">Status</label>
                         <select
-                          value={editingPedido.status || 'Pendente'}
+                          value={editingPedido.status || 'PENDING'}
                           onChange={(e: any) => setEditingPedido(prev => prev ? { ...prev, status: e.target.value } : null)}
                           className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
                         >
-                          <option value="Pendente">Pendente</option>
-                          <option value="Agendado">Agendado</option>
-                          <option value="Entregue">Entregue</option>
+                          <option value="PENDING">Pendente</option>
+                          <option value="RESCHEDULED">Reagendado / Agendado</option>
+                          <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
+                          <option value="DELIVERED">Entregue</option>
                         </select>
                       </div>
 
@@ -1608,7 +1626,7 @@ export default function App() {
                       </span>
                       <div>
                         <p className="text-xs font-bold text-slate-800">
-                          {p.status === 'Reagendado' ? (
+                          {p.status === 'RESCHEDULED' ? (
                             <span>Hoje é a data de entrega do pedido de <strong className="font-extrabold text-amber-950">{p.nomeCompleto}</strong>.</span>
                           ) : (
                             <span>Pedido agendado para hoje: <strong className="font-extrabold text-amber-950">{p.nomeCompleto}</strong> - <span className="text-slate-650">{p.produto}</span></span>
@@ -1634,7 +1652,7 @@ export default function App() {
               {/* Row 1: Tab switcher, Search input and Filter overview counter */}
               <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
                 
-                {/* Tab options Ativos x Entregues */}
+                {/* Tab options Ativos x Reagendados x Entregues */}
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="inline-flex bg-slate-100 p-1 border border-slate-200 rounded-full shrink-0">
                     <button
@@ -1651,7 +1669,22 @@ export default function App() {
                       }`}
                     >
                       <Clock className="w-3.5 h-3.5" />
-                      Ativos ({pedidos.filter(p => p.status === 'Pendente' || p.status === 'Agendado' || p.status === 'Reagendado').length})
+                      Ativos ({pedidos.filter(p => p.status === 'PENDING' || p.status === 'DELIVERED_UNPAID').length})
+                    </button>
+                    <button
+                      id="tab-reagendados"
+                      onClick={() => {
+                        setCurrentTab('reagendados');
+                        setSelectedStatuses(['Todos']);
+                      }}
+                      className={`px-4 sm:px-6 py-1.5 rounded-full text-xs font-extrabold transition flex items-center gap-1.5 cursor-pointer select-none ${
+                        currentTab === 'reagendados' 
+                          ? 'bg-amber-500 text-white shadow-xs' 
+                          : 'text-slate-500 hover:text-brand'
+                      }`}
+                    >
+                      <Calendar className="w-3.5 h-3.5" />
+                      Notas Agendadas ({pedidos.filter(p => p.status === 'RESCHEDULED').length})
                     </button>
                     <button
                       id="tab-entregues"
@@ -1666,7 +1699,7 @@ export default function App() {
                       }`}
                     >
                       <CheckCircle className="w-3.5 h-3.5" />
-                      Entregues ({pedidos.filter(p => p.status === 'Entregue' || p.status === 'Entregue e Não Pago').length})
+                      Entregues ({pedidos.filter(p => p.status === 'DELIVERED').length})
                     </button>
                   </div>
 
@@ -1721,7 +1754,7 @@ export default function App() {
                       {[
                         { key: 'Todos', label: 'Todos' },
                         { key: 'Pendentes', label: 'Pendentes' },
-                        { key: 'Reagendados', label: 'Agendados/Reagendados' },
+                        { key: 'Reagendados', label: 'Notas Agendadas / Pedidos Reagendados' },
                         { key: 'Entregue e não pago', label: 'Entregue e Não Pago' },
                         { key: 'Entregues', label: 'Entregues' }
                       ].map(item => {
@@ -1850,20 +1883,17 @@ export default function App() {
               </div>
 
             </div>
- 
+
             {/* PLANILHA COMPACT LIST (Spreadsheet styled lightweight list) */}
             <div className="overflow-x-auto">
-              <div className="min-w-[950px]">
+              <div className="min-w-[820px]">
                 
                 {/* Headers */}
-                <div className="grid grid-cols-[75px_75px_1.2fr_1.4fr_140px_105px_105px_auto] bg-slate-50 border-b border-slate-200 px-4 py-3.5 text-[10px] font-extrabold text-[#64748b] uppercase tracking-wider font-sans">
-                  <div>Venda</div>
-                  <div>Data</div>
+                <div className="grid grid-cols-[1.5fr_1.4fr_0.9fr_1.3fr_110px] bg-slate-50 border-b border-slate-200 px-4 py-3.5 text-[10px] font-extrabold text-[#64748b] uppercase tracking-wider font-sans">
                   <div>Cliente</div>
                   <div>Produto & Cor</div>
+                  <div className="text-right">Valor</div>
                   <div className="text-center">Status</div>
-                  <div className="text-right">Valor Total</div>
-                  <div className="text-right">Comissão</div>
                   <div className="text-center">Ações</div>
                 </div>
 
@@ -1875,125 +1905,84 @@ export default function App() {
                         key={pedido.id}
                         id={`row-${pedido.id}`}
                         onClick={() => handleSelectAndHighlightPedido(pedido)}
-                        className={`grid grid-cols-[75px_75px_1.2fr_1.4fr_140px_105px_105px_auto] px-4 py-3 text-xs items-center transition cursor-pointer select-none border-b border-slate-100 ${getRowBgClass(pedido.status, pedido.id)}`}
+                        className={`grid grid-cols-[1.5fr_1.4fr_0.9fr_1.3fr_110px] px-4 py-3 text-xs items-center transition cursor-pointer select-none border-b border-slate-100 ${getRowBgClass(pedido.status, pedido.id)}`}
                       >
-                        {/* Venda Num */}
-                        <div className="font-mono text-slate-850 font-bold">#{pedido.numeroVenda}</div>
-                        
-                        {/* Data */}
-                        <div className="text-slate-500 font-sans font-medium">{pedido.data}</div>
-                        
-                        {/* Cliente */}
-                        <div className="font-semibold text-slate-900 truncate pr-2">{pedido.nomeCompleto}</div>
-                        
-                        {/* Produto + Cor */}
-                        <div className="text-slate-800 truncate pr-2">
-                          <span className="font-medium">{pedido.produto}</span>
-                          {pedido.cor && <span className="text-slate-400 font-normal ml-1">({pedido.cor})</span>}
+                        {/* Cliente Column */}
+                        <div className="flex flex-col gap-0.5 min-w-0 pr-2">
+                          <span className="font-semibold text-slate-900 truncate">{pedido.nomeCompleto}</span>
+                          <span className="text-[10px] font-mono text-slate-500 flex items-center gap-1.5 shrink-0">
+                            <span className="bg-slate-100 px-1.5 py-0.5 rounded text-slate-700 font-bold">#{pedido.numeroVenda}</span>
+                            <span>•</span>
+                            <span>{pedido.data}</span>
+                          </span>
                         </div>
-                        
-                        {/* Status Column with interactive quick change dropdown trigger */}
-                        <div className="text-center relative shrink-0" onClick={(e) => e.stopPropagation()}>
-                          <button
-                            onClick={() => setShowDropdownId(showDropdownId === pedido.id ? null : pedido.id)}
-                            className="inline-flex items-center gap-1.5 cursor-pointer hover:opacity-85 transition focus:outline-none"
-                            title="Alterar Status"
+
+                        {/* Produto Column */}
+                        <div className="flex flex-col gap-0.5 min-w-0 pr-2">
+                          <span className="font-semibold text-slate-800 truncate">{pedido.produto}</span>
+                          {pedido.cor && (
+                            <span className="text-[10px] text-slate-500 truncate">Cor: <strong className="font-bold text-slate-600">{pedido.cor}</strong></span>
+                          )}
+                        </div>
+
+                        {/* Valor & Comissão Column */}
+                        <div className="text-right pr-3 flex flex-col items-end shrink-0">
+                          <span className="font-extrabold text-slate-900">
+                            R$ {pedido.valorTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </span>
+                          <span className="text-[9px] text-brand font-extrabold bg-brand/5 border border-brand/10 px-1.5 py-0.4 rounded-md mt-0.5">
+                            Comissão: R$ {pedido.comissao.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </span>
+                        </div>
+
+                        {/* Status Select Column (Saves automatically, realtime sync) */}
+                        <div className="px-1 text-center" onClick={(e) => e.stopPropagation()}>
+                          <select
+                            value={pedido.status}
+                            onChange={async (e) => {
+                              const nextStat = e.target.value as any;
+                              await handleQuickStatusUpdate(pedido.id, nextStat);
+                            }}
+                            className={`w-full py-1.5 px-2 bg-white text-slate-855 rounded-xl text-xs font-bold border outline-none focus:ring-1 focus:ring-brand cursor-pointer shadow-3xs transition-colors duration-200 ${
+                              pedido.status === 'PENDING' ? 'bg-amber-50 text-amber-850 border-amber-300' :
+                              pedido.status === 'RESCHEDULED' ? 'bg-yellow-50 text-amber-950 border-yellow-300' :
+                              pedido.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-900 border-blue-300' :
+                              'bg-emerald-50 text-emerald-950 border-emerald-300'
+                            }`}
                           >
-                            {pedido.status === 'Pendente' && (
-                              <span className="inline-flex items-center gap-1 text-[9px] font-extrabold bg-amber-50 text-amber-600 border border-amber-200/60 px-2.5 py-1 rounded-full uppercase tracking-wider">
-                                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
-                                Pendente
-                              </span>
-                            )}
-                            {pedido.status === 'Reagendado' && (
-                              <span className="inline-flex items-center gap-1 text-[9px] font-extrabold bg-amber-50/40 text-yellow-600 border border-amber-200/50 px-2.5 py-1 rounded-full uppercase tracking-wider">
-                                <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                                Reagendado {pedido.dataReagendamento ? `(${pedido.dataReagendamento})` : ''}
-                              </span>
-                            )}
-                            {pedido.status === 'Agendado' && (
-                              <span className="inline-flex items-center gap-1 text-[9px] font-extrabold bg-amber-50/40 text-yellow-650 border border-amber-200/50 px-2.5 py-1 rounded-full uppercase tracking-wider">
-                                <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                                Agendado {pedido.dataReagendamento ? `(${pedido.dataReagendamento})` : ''}
-                              </span>
-                            )}
-                            {pedido.status === 'Entregue e Não Pago' && (
-                              <span className="inline-flex items-center gap-1 text-[9px] font-extrabold bg-blue-50 text-blue-650 border border-blue-200/60 px-2.5 py-1 rounded-full uppercase tracking-wider">
-                                <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
-                                Entregue / N.P.
-                              </span>
-                            )}
-                            {pedido.status === 'Entregue' && (
-                              <span className="inline-flex items-center gap-1 text-[9px] font-extrabold bg-emerald-50 text-emerald-600 border border-emerald-200/60 px-2.5 py-1 rounded-full uppercase tracking-wider">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                                Entregue
-                              </span>
-                            )}
-                          </button>
-
-                          {showDropdownId === pedido.id && (
-                            <div ref={dropdownRef} className="absolute left-1/2 -translate-x-1/2 mt-1.5 w-48 bg-white border border-slate-200 rounded-2xl shadow-xl py-2 z-50 text-xs text-left text-slate-700">
-                              <div className="px-3 py-1 text-[9px] font-extrabold text-slate-400 uppercase tracking-wide border-b border-slate-100 mb-1">
-                                Alternar Status
-                              </div>
-                              <button 
-                                onClick={() => handleQuickStatusUpdate(pedido.id, 'Pendente')}
-                                className={`w-full text-left px-3 py-1.5 hover:bg-slate-50 flex items-center gap-2 font-semibold ${pedido.status === 'Pendente' ? 'text-amber-650 bg-amber-50/50' : 'text-slate-700'}`}
-                              >
-                                <span className="w-2 h-2 rounded-full bg-orange-500"></span>
-                                Pendente
-                              </button>
-                              
-                              <button 
-                                onClick={() => handleQuickStatusUpdate(pedido.id, 'Reagendado')}
-                                className={`w-full text-left px-3 py-1.5 hover:bg-slate-50 flex items-center gap-2 font-semibold ${pedido.status === 'Reagendado' || pedido.status === 'Agendado' ? 'text-yellow-600 bg-amber-50/20' : 'text-slate-700'}`}
-                              >
-                                <span className="w-2 h-2 rounded-full bg-yellow-400"></span>
-                                Reagendar / Agendar
-                              </button>
-
-                              <button 
-                                onClick={() => handleQuickStatusUpdate(pedido.id, 'Entregue e Não Pago')}
-                                className={`w-full text-left px-3 py-1.5 hover:bg-slate-50 flex items-center gap-2 font-semibold ${pedido.status === 'Entregue e Não Pago' ? 'text-blue-600 bg-blue-50/50' : 'text-slate-700'}`}
-                              >
-                                <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-                                Entregue e não Pago
-                              </button>
-
-                              <button 
-                                onClick={() => handleQuickStatusUpdate(pedido.id, 'Entregue')}
-                                className={`w-full text-left px-3 py-1.5 hover:bg-slate-50 flex items-center gap-2 font-semibold ${pedido.status === 'Entregue' ? 'text-emerald-600 bg-emerald-50/50' : 'text-slate-700'}`}
-                              >
-                                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                                Entregue
-                              </button>
+                            <option value="PENDING">Pendente</option>
+                            <option value="RESCHEDULED">Reagendado / Agendado</option>
+                            <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
+                            <option value="DELIVERED">Entregue</option>
+                          </select>
+                          {pedido.status === 'RESCHEDULED' && (pedido.dataReagendamento || pedido.rescheduleDate) && (
+                            <div className="text-[9px] text-amber-900 font-extrabold flex items-center justify-center gap-1 mt-1 font-sans">
+                              <Calendar className="w-3 h-3 text-amber-600 shrink-0 inline" />
+                              <span>Reagendado: {pedido.dataReagendamento || pedido.rescheduleDate}</span>
                             </div>
                           )}
                         </div>
 
-                        {/* Valor Total */}
-                        <div className="text-right font-extrabold text-slate-900 pr-1">
-                          R$ {pedido.valorTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                        </div>
-                        
-                        {/* Comissão */}
-                        <div className="text-right pr-2">
-                          <span className="font-mono font-extrabold text-brand bg-brand/5 border border-brand/10 px-2.5 py-1 rounded-lg">
-                            R$ {pedido.comissao.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                          </span>
-                        </div>
-
-                        {/* Actions Column (Initially display ONLY WhatsApp copy ficha icon) */}
-                        <div className="flex items-center justify-center pointer-events-auto" onClick={(e) => e.stopPropagation()}>
+                        {/* Actions: Detalhes and Copiar Ficha */}
+                        <div className="flex items-center justify-center gap-1" onClick={(e) => e.stopPropagation()}>
+                          {/* Detalhes button */}
+                          <button
+                            onClick={() => setSelectedPedido(pedido)}
+                            className="p-1.5 bg-slate-50 border border-slate-200 text-slate-650 hover:bg-slate-100 hover:text-brand rounded-lg transition shrink-0"
+                            title="Ver Detalhes do Pedido"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                          </button>
+                          
+                          {/* Copiar Ficha button */}
                           <button
                             onClick={() => copyToClipboard(pedido.textoOriginal, 'Texto de Ficha')}
-                            className="p-1 px-[7px] text-slate-400 hover:text-brand hover:bg-slate-100 rounded-lg transition"
+                            className="p-1.5 bg-slate-50 border border-slate-200 text-slate-650 hover:bg-brand/10 hover:text-brand hover:border-brand/20 rounded-lg transition shrink-0"
                             title="Copiar Ficha do WhatsApp"
                           >
                             <Copy className="w-3.5 h-3.5" />
                           </button>
                         </div>
-
                       </div>
                     ))}
                   </div>
@@ -2171,18 +2160,26 @@ export default function App() {
                             value={p.status}
                             onChange={async (e) => {
                               const nextStat = e.target.value as any;
-                              await updatePedidoStatus(p.id, nextStat);
-                              triggerToast('success', `Status alterado na planilha: ${nextStat}`);
+                              if (nextStat === 'RESCHEDULED') {
+                                handleQuickStatusUpdate(p.id, 'RESCHEDULED');
+                              } else {
+                                await updatePedidoStatus(p.id, nextStat);
+                                const readable = nextStat === 'PENDING' ? 'Pendente' :
+                                                 nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' : 'Entregue';
+                                triggerToast('success', `Status alterado na planilha: ${readable}`);
+                              }
                             }}
                             className={`w-full text-center p-1 rounded border border-natural-border-dark outline-none font-semibold ${
-                              p.status === 'Pendente' ? 'bg-blue-50 text-blue-700' :
-                              p.status === 'Agendado' ? 'bg-orange-50/75 text-orange-950' :
-                              'bg-brand-light text-brand'
+                              p.status === 'PENDING' ? 'bg-amber-50 text-amber-700' :
+                              p.status === 'RESCHEDULED' ? 'bg-orange-50/75 text-orange-950' :
+                              p.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-700' :
+                              'bg-emerald-50 text-emerald-700'
                             }`}
                           >
-                            <option value="Pendente">Pendente</option>
-                            <option value="Agendado">Agendado</option>
-                            <option value="Entregue">Entregue</option>
+                            <option value="PENDING">Pendente</option>
+                            <option value="RESCHEDULED">Reagendado / Agendado</option>
+                            <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
+                            <option value="DELIVERED">Entregue</option>
                           </select>
                         </td>
 
@@ -2243,12 +2240,18 @@ export default function App() {
                 
                 {/* Badge of status */}
                 <div className="flex items-center gap-2">
-                  <span className={`text-[10px] uppercase font-bold tracking-widest px-2.5 py-0.5 rounded-full ${
-                    selectedPedido.status === 'Pendente' ? 'bg-amber-500/20 text-amber-200' :
-                    selectedPedido.status === 'Agendado' ? 'bg-blue-500/20 text-blue-200' :
+                  <span className={`text-[10px] uppercase font-bold tracking-widest px-2.5 py-0.5 rounded-full flex items-center gap-1.5 ${
+                    selectedPedido.status === 'PENDING' ? 'bg-amber-500/20 text-amber-250' :
+                    selectedPedido.status === 'RESCHEDULED' ? 'bg-yellow-500/25 text-yellow-200 border border-yellow-300/40' :
+                    selectedPedido.status === 'DELIVERED_UNPAID' ? 'bg-blue-500/20 text-blue-200' :
                     'bg-emerald-500/20 text-emerald-200'
                   }`}>
-                    {selectedPedido.status}
+                    {selectedPedido.status === 'RESCHEDULED' && <Calendar className="w-3.5 h-3.5 shrink-0" />}
+                    <span>
+                      {selectedPedido.status === 'PENDING' ? 'Pendente' :
+                       selectedPedido.status === 'RESCHEDULED' ? `Reagendado ${selectedPedido.dataReagendamento ? `(${selectedPedido.dataReagendamento})` : ''}` :
+                       selectedPedido.status === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' : 'Entregue'}
+                    </span>
                   </span>
                   <button 
                     onClick={() => setSelectedPedido(null)}
@@ -2478,7 +2481,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => {
-                    handleQuickStatusUpdate(reschedulingPedido.id, 'Reagendado', { dataReagendamento: rescheduleInputDate });
+                    handleQuickStatusUpdate(reschedulingPedido.id, 'RESCHEDULED', { dataReagendamento: rescheduleInputDate });
                     setReschedulingPedido(null);
                   }}
                   className="bg-amber-500 hover:bg-amber-600 text-white text-xs py-2 px-5 rounded-full font-bold shadow-xs transition cursor-pointer"
@@ -2730,7 +2733,9 @@ export default function App() {
                             <div className="flex items-center justify-between text-[10px] text-slate-500 pt-0.5">
                               <p>Telefone: <span className="font-mono text-slate-800">{item.pedido.telefone1 || 'Não informado'}</span></p>
                               <p className="bg-slate-100 text-slate-800 font-mono px-1.5 py-0.2 rounded font-bold uppercase">
-                                STATUS: {item.pedido.status}
+                                STATUS: {item.pedido.status === 'PENDING' ? 'Pendente' :
+                                         item.pedido.status === 'RESCHEDULED' ? 'Reagendado' :
+                                         item.pedido.status === 'DELIVERED_UNPAID' ? 'Entregue/N.P.' : 'Entregue'}
                               </p>
                             </div>
                           </div>

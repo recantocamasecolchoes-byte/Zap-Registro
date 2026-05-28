@@ -12,8 +12,9 @@ export interface Pedido {
   formaPagamento: string;
   valorTotal: number;
   comissao: number;
-  status: 'Pendente' | 'Agendado' | 'Reagendado' | 'Entregue e Não Pago' | 'Entregue';
+  status: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED';
   dataReagendamento?: string;
+  rescheduleDate?: string;
   textoOriginal: string;
   observacoes: string;
   userId?: string;

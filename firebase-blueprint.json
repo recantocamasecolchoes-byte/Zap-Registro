@@ -55,7 +55,7 @@
         },
         "status": {
           "type": "string",
-          "enum": ["Pendente", "Agendado", "Entregue"],
+          "enum": ["PENDING", "RESCHEDULED", "DELIVERED_UNPAID", "DELIVERED"],
           "description": "Situação do pedido"
         },
         "textoOriginal": {
@@ -90,7 +90,7 @@
     }
   },
   "firestore": {
-    "pedidos/{pedidoId}": {
+    "orders/{orderId}": {
       "schema": "pedido",
       "description": "Coleção de pedidos cadastrados por vendedores de móveis"
     }
