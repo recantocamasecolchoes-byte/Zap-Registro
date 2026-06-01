@@ -8,7 +8,9 @@ import {
   onSnapshot, 
   query, 
   orderBy,
-  serverTimestamp
+  serverTimestamp,
+  getDocs,
+  where
 } from 'firebase/firestore';
 import { db, auth, isFirebaseConfigured, handleFirestoreError, OperationType } from './firebase';
 import { Pedido } from './types';
@@ -380,5 +382,237 @@ export function forceManualSyncRefresh(): void {
     window.dispatchEvent(new Event("iazap_db_update"));
   } else {
     window.dispatchEvent(new Event("iazap_db_update"));
+  }
+}
+
+export interface BackupItem {
+  id: string;
+  createdAt: string;
+  recordsCount: number;
+  responsibleUser: string;
+  fileSize: string;
+  backupType: 'manual' | 'automatico';
+  backupData: string; // JSON string of Pedidos
+}
+
+// In-memory list of backups when offline
+let currentOfflineBackups: BackupItem[] = [];
+
+function getLocalStorageBackups(): BackupItem[] {
+  const data = localStorage.getItem("iazap_system_backups");
+  if (!data) return [];
+  try {
+    currentOfflineBackups = JSON.parse(data);
+    return currentOfflineBackups;
+  } catch (e) {
+    return [];
+  }
+}
+
+function setLocalStorageBackups(backups: BackupItem[]) {
+  currentOfflineBackups = [...backups];
+  localStorage.setItem("iazap_system_backups", JSON.stringify(backups));
+  window.dispatchEvent(new Event("iazap_backups_update"));
+}
+
+const backupsLocalListeners: Set<(backups: BackupItem[]) => void> = new Set();
+if (typeof window !== "undefined") {
+  window.addEventListener("iazap_backups_update", () => {
+    const fresh = getLocalStorageBackups();
+    backupsLocalListeners.forEach(listener => listener(fresh));
+  });
+}
+
+/**
+ * Saves backup metadata and contents to Firebase or LocalStorage
+ */
+export async function saveBackupMetadata(backup: Omit<BackupItem, "id">): Promise<string> {
+  const finalId = `backup-${Date.now()}`;
+  const payload = {
+    createdAt: backup.createdAt,
+    recordsCount: Number(backup.recordsCount) || 0,
+    responsibleUser: backup.responsibleUser || 'sistema',
+    fileSize: backup.fileSize,
+    backupType: backup.backupType,
+    // Store full backupData if appropriate size, else truncated (but let's store it as demanded for direct recovery)
+    backupData: backup.backupData
+  };
+
+  if (isFirebaseConfigured && db) {
+    try {
+      const docRef = doc(db, "system_backups", finalId);
+      await setDoc(docRef, payload);
+      
+      // Auto prune: keep only last 30 automated backups
+      if (backup.backupType === 'automatico') {
+        const q = query(
+          collection(db, "system_backups"), 
+          where("backupType", "==", "automatico"),
+          orderBy("createdAt", "asc")
+        );
+        const snapshot = await getDocs(q);
+        if (snapshot.size > 30) {
+          const docsToDelete = snapshot.docs.slice(0, snapshot.size - 30);
+          for (const docSnap of docsToDelete) {
+            await deleteDoc(docSnap.ref);
+          }
+        }
+      }
+      return finalId;
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.WRITE, `system_backups/${finalId}`);
+    }
+  } else {
+    // LocalStorage Mode
+    const list = getLocalStorageBackups();
+    const newItem: BackupItem = {
+      ...payload,
+      id: finalId
+    };
+    list.push(newItem);
+    
+    // Sort so newest is first or manage pruning of automated backups
+    let automated = list.filter(b => b.backupType === 'automatico');
+    const manualAndOthers = list.filter(b => b.backupType !== 'automatico');
+    
+    if (automated.length > 30) {
+      // Sort older to newer to prune the oldest
+      automated.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      automated = automated.slice(automated.length - 30);
+    }
+    
+    const finalBackups = [...manualAndOthers, ...automated];
+    // Sort final list by createdAt descending
+    finalBackups.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    
+    setLocalStorageBackups(finalBackups);
+    return finalId;
+  }
+}
+
+/**
+ * Subscribes to realtime changes in Backup History list
+ */
+export function subscribeBackupHistory(
+  onUpdate: (backups: BackupItem[]) => void,
+  onError: (error: any) => void
+): () => void {
+  if (isFirebaseConfigured && db) {
+    const q = query(collection(db, "system_backups"), orderBy("createdAt", "desc"));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list: BackupItem[] = [];
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        list.push({
+          id: docSnap.id,
+          createdAt: d.createdAt || '',
+          recordsCount: d.recordsCount || 0,
+          responsibleUser: d.responsibleUser || 'sistema',
+          fileSize: d.fileSize || '0 KB',
+          backupType: d.backupType || 'manual',
+          backupData: d.backupData || '[]'
+        });
+      });
+      onUpdate(list);
+    }, (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, "system_backups");
+      } catch (formattedError: any) {
+        onError(formattedError);
+      }
+    });
+    return unsubscribe;
+  } else {
+    // LocalStorage mode
+    const list = getLocalStorageBackups();
+    // Sort descending
+    list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    onUpdate(list);
+    
+    const localCallback = (freshList: BackupItem[]) => {
+      freshList.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      onUpdate(freshList);
+    };
+    backupsLocalListeners.add(localCallback);
+    return () => {
+      backupsLocalListeners.delete(localCallback);
+    };
+  }
+}
+
+/**
+ * Deletes a single backup from database/local storage
+ */
+export async function deleteBackup(id: string): Promise<void> {
+  if (isFirebaseConfigured && db) {
+    try {
+      const docRef = doc(db, "system_backups", id);
+      await deleteDoc(docRef);
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.DELETE, `system_backups/${id}`);
+    }
+  } else {
+    const list = getLocalStorageBackups();
+    const filtered = list.filter(b => b.id !== id);
+    setLocalStorageBackups(filtered);
+  }
+}
+
+/**
+ * Fully restores system pedidios database by over-writing orders
+ */
+export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<void> {
+  if (isFirebaseConfigured && db) {
+    try {
+      // For each pedido, write to "orders"
+      for (const p of restoredPedidos) {
+        const docId = p.id || `restored-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+        const docRef = doc(db, "orders", docId);
+        
+        // Sanitize & map inputs
+        const rawStatus = p.status as any;
+        const fileStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
+          (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
+          (rawStatus === 'Reagendado' || rawStatus === 'Agendado' || rawStatus === 'RESCHEDULED') ? 'RESCHEDULED' :
+          (rawStatus === 'Entregue e Não Pago' || rawStatus === 'DELIVERED_UNPAID' || rawStatus === 'Entregue / N.P.') ? 'DELIVERED_UNPAID' :
+          (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
+          (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
+
+        const payload: any = {
+          numeroVenda: p.numeroVenda || '',
+          data: p.data || '',
+          nomeCompleto: p.nomeCompleto || '',
+          telefone1: p.telefone1 || '',
+          telefone2: p.telefone2 || '',
+          endereco: p.endereco || '',
+          produto: p.produto || '',
+          cor: p.cor || '',
+          quantidade: Number(p.quantidade) || 1,
+          formaPagamento: p.formaPagamento || '',
+          valorTotal: Number(p.valorTotal) || 0,
+          comissao: Number(p.comissao) || 0,
+          status: fileStatus,
+          dataReagendamento: p.dataReagendamento || p.rescheduleDate || '',
+          rescheduleDate: p.rescheduleDate || p.dataReagendamento || '',
+          textoOriginal: p.textoOriginal || '',
+          observacoes: p.observacoes || '',
+          supplier: p.supplier || 'SOFIA_HOME_DECOR',
+          updatedAt: serverTimestamp()
+        };
+        if (p.userId) payload.userId = p.userId;
+        if (p.createdAt) {
+          payload.createdAt = p.createdAt;
+        } else {
+          payload.createdAt = serverTimestamp();
+        }
+        
+        await setDoc(docRef, payload, { merge: true });
+      }
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.WRITE, "orders/restore");
+    }
+  } else {
+    // LocalStorage mode
+    setLocalStoragePedidos(restoredPedidos);
   }
 }

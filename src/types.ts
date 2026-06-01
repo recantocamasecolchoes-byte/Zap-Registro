@@ -17,8 +17,21 @@ export interface Pedido {
   rescheduleDate?: string;
   textoOriginal: string;
   observacoes: string;
+  city?: string;
+  state?: string;
   supplier?: 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS';
   userId?: string;
   createdAt?: string | number | Date | any;
   updatedAt?: string | number | Date | any;
+}
+
+export interface AiAnalysisLog {
+  id: string;
+  timestamp: string;
+  durationMs: number;
+  textLength: number;
+  inputText: string;
+  error?: string;
+  response?: string;
+  isRapid: boolean;
 }

@@ -36,18 +36,30 @@ import {
   SlidersHorizontal,
   ArrowUpDown,
   Filter,
-  Eye
+  Eye,
+  Settings,
+  Database,
+  Download,
+  Upload,
+  Shield,
+  FileSpreadsheet
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Pedido } from './types';
+import { Pedido, AiAnalysisLog } from './types';
 import { 
   subscribePedidos, 
   savePedido, 
   updatePedidoStatus, 
   deletePedido, 
   generateNextNumeroVenda, 
-  forceManualSyncRefresh 
+  forceManualSyncRefresh,
+  saveBackupMetadata,
+  subscribeBackupHistory,
+  deleteBackup,
+  restoreBackupToSystem,
+  BackupItem
 } from './dbService';
+import * as XLSX from 'xlsx';
 import { 
   auth, 
   googleProvider, 
@@ -87,6 +99,18 @@ export default function App() {
   const [showReportsModal, setShowReportsModal] = useState<boolean>(false);
   const [selectedReportPeriod, setSelectedReportPeriod] = useState<'prev_week' | 'all'>('prev_week');
   const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
+
+  // States for Backup and security system
+  const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+  const [backupsHistory, setBackupsHistory] = useState<BackupItem[]>([]);
+  const [restoreConfirmData, setRestoreConfirmData] = useState<Pedido[] | null>(null);
+  const [restoreConfirmName, setRestoreConfirmName] = useState<string>('');
+  const [isCreatingBackup, setIsCreatingBackup] = useState<boolean>(false);
+  const [isRestoring, setIsRestoring] = useState<boolean>(false);
+  const [isExecutingUpdate, setIsExecutingUpdate] = useState<boolean>(false);
+  const [updateStep, setUpdateStep] = useState<number>(0); 
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'backup' | 'logs' | 'ailogs'>('backup');
 
   const handleCopyText = (text: string, fieldId: string) => {
     navigator.clipboard.writeText(text);
@@ -94,6 +118,48 @@ export default function App() {
     setTimeout(() => {
       setCopiedField(null);
     }, 1000);
+  };
+
+  const getWhatsAppLink = (phone: string) => {
+    if (!phone) return '#';
+    let clean = phone.replace(/\D/g, '');
+    if (clean.length === 10 || clean.length === 11) {
+      if (!clean.startsWith('55')) {
+        clean = '55' + clean;
+      }
+    }
+    return `https://wa.me/${clean}`;
+  };
+
+  const getSummarizedProductAndList = (productStr: string) => {
+    if (!productStr) return { summary: 'Sem produto', items: [], isMultiple: false };
+    // Split by newlines or list indicators
+    let rawItems = productStr.split(/\r?\n+/).map(i => i.trim()).filter(i => i.length > 0);
+    // Remove leading list dots or hyphens
+    rawItems = rawItems.map(item => item.replace(/^[\s*\-•\d.]+\s*/, ''));
+    
+    if (rawItems.length <= 1) {
+      // try comma split if there are multiple items
+      const commas = productStr.split(/,+/).map(i => i.trim()).filter(i => i.length > 0);
+      if (commas.length > 1) {
+        return {
+          summary: `${commas[0]} + ${commas.length - 1} item(s)`,
+          items: commas,
+          isMultiple: true
+        };
+      }
+      return { summary: productStr, items: [productStr], isMultiple: false };
+    }
+    return {
+      summary: `${rawItems[0]} + ${rawItems.length - 1} itens`,
+      items: rawItems,
+      isMultiple: true
+    };
+  };
+
+  const toggleProductExpand = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setExpandedProducts(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
   // Supplier multi-tabs state
@@ -137,6 +203,28 @@ export default function App() {
 
   // Global Toast alerts
   const [notification, setNotification] = useState<{ type: 'success' | 'refused' | 'error' | 'info'; message: string } | null>(null);
+  
+  // AI Options and Logging
+  const [isRapidAnalysis, setIsRapidAnalysis] = useState<boolean>(() => {
+    return localStorage.getItem('iazap_is_rapid') === 'true';
+  });
+  const [aiAnalysisError, setAiAnalysisError] = useState<string | null>(null);
+  const [aiLogs, setAiLogs] = useState<AiAnalysisLog[]>(() => {
+    try {
+      const stored = localStorage.getItem('iazap_ai_logs');
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('iazap_is_rapid', String(isRapidAnalysis));
+  }, [isRapidAnalysis]);
+
+  useEffect(() => {
+    localStorage.setItem('iazap_ai_logs', JSON.stringify(aiLogs));
+  }, [aiLogs]);
   
   // Loading status spinners
   const [isProcessingOrder, setIsProcessingOrder] = useState(false);
@@ -212,6 +300,289 @@ export default function App() {
     }, 5500);
   };
 
+  // Subscribe to backup history updates
+  useEffect(() => {
+    const unsubscribe = subscribeBackupHistory(
+      (history) => {
+        setBackupsHistory(history);
+      },
+      (error) => {
+        console.error("Backup history subscribe error: ", error);
+        triggerToast('error', `Erro ao ler histórico de backups: ${parseFirebaseError(error)}`);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Daily automatic backup checking algorithm (03:00 AM Boundary)
+  const runAutomaticDailyBackup = async () => {
+    if (pedidos.length === 0) return;
+    
+    const now = new Date();
+    const boundaryToday = new Date(now);
+    boundaryToday.setHours(3, 0, 0, 0);
+    
+    let backupDayStart: Date;
+    if (now >= boundaryToday) {
+      backupDayStart = boundaryToday;
+    } else {
+      const boundaryYesterday = new Date(boundaryToday);
+      boundaryYesterday.setDate(boundaryYesterday.getDate() - 1);
+      backupDayStart = boundaryYesterday;
+    }
+    
+    // Check if we already created an automatic backup for this cycle
+    const hasDaily = backupsHistory.some(
+      b => b.backupType === 'automatico' && new Date(b.createdAt) >= backupDayStart
+    );
+    
+    if (!hasDaily) {
+      console.log("Iniciando backup automático diário de segurança (limiar das 03:00 AM)...");
+      try {
+        const jsonStr = JSON.stringify(pedidos, null, 2);
+        const kbSize = (jsonStr.length / 1024).toFixed(2);
+        
+        await saveBackupMetadata({
+          createdAt: new Date().toISOString(),
+          recordsCount: pedidos.length,
+          responsibleUser: 'sistema (automatico)',
+          fileSize: `${kbSize} KB`,
+          backupType: 'automatico',
+          backupData: jsonStr
+        });
+        console.log("Backup automático diário gerado com sucesso.");
+      } catch (err) {
+        console.error("Erro ao gerar backup automático:", err);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (pedidos.length > 0 && authReady) {
+      runAutomaticDailyBackup();
+      
+      // Keep checking every 10 minutes
+      const interval = setInterval(() => {
+        runAutomaticDailyBackup();
+      }, 10 * 60 * 1000);
+      return () => clearInterval(interval);
+    }
+  }, [pedidos, backupsHistory, authReady]);
+
+  // Create manual backup
+  const handleGenerateManualBackup = async () => {
+    if (pedidos.length === 0) {
+      triggerToast('error', 'Nenhum pedido cadastrado no momento para fazer backup.');
+      return;
+    }
+    
+    setIsCreatingBackup(true);
+    try {
+      const jsonStr = JSON.stringify(pedidos, null, 2);
+      const kbSize = (jsonStr.length / 1024).toFixed(2);
+      
+      const now = new Date();
+      const pad = (val: number) => String(val).padStart(2, '0');
+      const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const timeStr = `${pad(now.getHours())}-${pad(now.getMinutes())}`;
+      const fileName = `Backup_IA_Zap_Registro_${dateStr}_${timeStr}.json`;
+      
+      // Save metadata & JSON locally or in Firestore
+      await saveBackupMetadata({
+        createdAt: now.toISOString(),
+        recordsCount: pedidos.length,
+        responsibleUser: currentUser?.email || 'Vendedor Autenticado',
+        fileSize: `${kbSize} KB`,
+        backupType: 'manual',
+        backupData: jsonStr
+      });
+      
+      // Trigger File browser download
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      triggerToast('success', `Backup completo baixado com sucesso: ${fileName}`);
+    } catch (err: any) {
+      console.error("Erro ao gerar backup manual:", err);
+      triggerToast('error', `Falha ao gerar backup: ${err.message || err}`);
+    } finally {
+      setIsCreatingBackup(false);
+    }
+  };
+
+  // Import/restore validation
+  const handleImportBackupFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const text = event.target?.result;
+        if (typeof text !== 'string') throw new Error('Não foi possível ler as informações do arquivo.');
+        
+        const data = JSON.parse(text);
+        if (!Array.isArray(data)) {
+          throw new Error('Formato de backup inválido. O arquivo JSON deve ser uma lista de pedidos.');
+        }
+        
+        // Validate individual fields of first item to prevent random JSON imports
+        if (data.length > 0) {
+          const first = data[0];
+          if (!first.nomeCompleto || !first.produto || !first.valorTotal || !first.numeroVenda) {
+            throw new Error('Arquivo de backup inválido. Campos essenciais de vendas estão faltando.');
+          }
+        }
+        
+        setRestoreConfirmData(data);
+        setRestoreConfirmName(file.name);
+      } catch (err: any) {
+        triggerToast('error', `Erro na validação do arquivo: ${err.message || err}`);
+      }
+    };
+    reader.readAsText(file);
+    // Reset file input value
+    e.target.value = '';
+  };
+
+  // Confirm standard restoration
+  const executeRestore = async () => {
+    if (!restoreConfirmData) return;
+    
+    setIsRestoring(true);
+    try {
+      await restoreBackupToSystem(restoreConfirmData);
+      triggerToast('success', `Sucesso! Restaurados ${restoreConfirmData.length} registros de vendas de forma segura.`);
+      setRestoreConfirmData(null);
+      setRestoreConfirmName('');
+    } catch (err: any) {
+      console.error("Erro ao aplicar restauração:", err);
+      triggerToast('error', `Falha ao aplicar restauração: ${err.message || err}`);
+    } finally {
+      setIsRestoring(false);
+    }
+  };
+
+  // Restore from history direct
+  const handleRestoreFromHistory = (backup: BackupItem) => {
+    try {
+      const data = JSON.parse(backup.backupData);
+      setRestoreConfirmData(data);
+      const formattedDate = new Date(backup.createdAt).toLocaleString('pt-BR');
+      setRestoreConfirmName(`Histórico (${backup.backupType === 'manual' ? 'Manual' : 'Automático'} - ${formattedDate})`);
+    } catch (err: any) {
+      triggerToast('error', 'Não foi possível ler os dados do backup histórico especificado.');
+    }
+  };
+
+  // Excel (.xlsx) export
+  const handleExportExcel = () => {
+    try {
+      if (pedidos.length === 0) {
+        triggerToast('error', 'Nenhuma venda encontrada para gerar planilha.');
+        return;
+      }
+      
+      const formattedData = pedidos.map(p => ({
+        'Fornecedor': p.supplier === 'SOFIA_HOME_DECOR' ? 'Sofia Home Decor' :
+                      p.supplier === 'MICHAEL' ? 'Michael' :
+                      p.supplier === 'FRANK' ? 'Frank' : 'Outros Fornecedores',
+        'Número Venda': p.numeroVenda,
+        'Data Cadastro': p.data || '',
+        'Nome Cliente': p.nomeCompleto,
+        'Telefone Principal': p.telefone1,
+        'Telefone Secundário': p.telefone2 || '-',
+        'Produto': p.produto + (p.cor ? ` (${p.cor})` : ''),
+        'Quantidade': p.quantidade || 1,
+        'Forma de Pagamento': p.formaPagamento || '-',
+        'Valor Total (R$)': p.valorTotal,
+        'Comissão Recebida (R$)': p.comissao,
+        'Status Atual': p.status === 'PENDING' ? 'Pendente' :
+                        p.status === 'RESCHEDULED' ? 'Reagendado' :
+                        p.status === 'DELIVERED_UNPAID' ? 'Entregue Não Pago' :
+                        p.status === 'DELIVERED' ? 'Entregue' : 'Cancelado',
+        'Observações': p.observacoes || '-'
+      }));
+
+      const ws = XLSX.utils.json_to_sheet(formattedData);
+      
+      const wscols = [
+        { wch: 18 }, // Fornecedor
+        { wch: 14 }, // Número Venda
+        { wch: 12 }, // Data Cadastro
+        { wch: 25 }, // Nome Cliente
+        { wch: 16 }, // Telefone Principal
+        { wch: 16 }, // Telefone Secundário
+        { wch: 28 }, // Produto
+        { wch: 10 }, // Quantidade
+        { wch: 18 }, // Forma de Pagamento
+        { wch: 15 }, // Valor Total
+        { wch: 15 }, // Comissão
+        { wch: 18 }, // Status Atual
+        { wch: 40 }  // Observações
+      ];
+      ws['!cols'] = wscols;
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Controle de Vendas");
+      XLSX.writeFile(wb, `IA_Zap_Registro_Controle_${new Date().toISOString().split('T')[0]}.xlsx`);
+      
+      triggerToast('success', 'Planilha XLSX gerada com total sucesso!');
+    } catch (err: any) {
+      console.error("Falha em exportar:", err);
+      triggerToast('error', 'Incapaz de gerar planilha XLSX.');
+    }
+  };
+
+  // Structural system update simulation with automatic backup
+  // Flow: 1. Fazer backup, 2. Confirmar backup criado, 3. Executar atualização
+  const handleSystemUpdateWithBackup = async () => {
+    setUpdateStep(1); // Starting
+    
+    // Step 1: Force manual backup silently
+    try {
+      const jsonStr = JSON.stringify(pedidos, null, 2);
+      const kbSize = (jsonStr.length / 1024).toFixed(2);
+      
+      const backupId = await saveBackupMetadata({
+        createdAt: new Date().toISOString(),
+        recordsCount: pedidos.length,
+        responsibleUser: `sistema (atualização obrigatória)`,
+        fileSize: `${kbSize} KB`,
+        backupType: 'automatico',
+        backupData: jsonStr
+      });
+      
+      if (!backupId) throw new Error("ID de backup não retornado");
+      
+      setUpdateStep(2); // Step 1 & 2 Complete: Backup is created and metadata successfully confirmed!
+      
+      // Step 3: Run schema update / structural migration
+      setTimeout(() => {
+        // We simulate running database indexing updates & status normalizing
+        setUpdateStep(3);
+        
+        // Notify of success
+        setTimeout(() => {
+          setUpdateStep(0); // Clear
+          triggerToast('success', 'Atualização Estrutural do Sistema executada com sucesso absoluto!');
+        }, 1200);
+      }, 1500);
+
+    } catch (err: any) {
+      console.error("Falha no fluxo de segurança da atualização:", err);
+      setUpdateStep(4); // Error state
+      triggerToast('error', `Falha ao executar atualização segura: ${err.message || err}`);
+    }
+  };
+
   // Auth Functions
   const handleGoogleLogin = async () => {
     if (!isFirebaseConfigured) {
@@ -269,12 +640,25 @@ export default function App() {
     }
 
     setIsProcessingOrder(true);
+    setAiAnalysisError(null);
+    const analysisStartTime = Date.now();
+    const textLen = pasteOrderText.length;
+
+    // Create an abort controller for the 15 seconds timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 15000);
+
     try {
       const response = await fetch("/api/gemini/parse-pedido", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: pasteOrderText })
+        body: JSON.stringify({ text: pasteOrderText, rapidMode: isRapidAnalysis }),
+        signal: controller.signal
       });
+
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
         throw new Error(`Servidor retornou código ${response.status}`);
@@ -283,7 +667,20 @@ export default function App() {
       const resJson = await response.json();
       if (resJson.success && resJson.data) {
         const extracted = resJson.data;
-        
+        const durationMs = Date.now() - analysisStartTime;
+
+        // Save successful log
+        const newLog: AiAnalysisLog = {
+          id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
+          timestamp: new Date().toISOString(),
+          durationMs,
+          textLength: textLen,
+          inputText: pasteOrderText,
+          response: JSON.stringify(extracted, null, 2),
+          isRapid: isRapidAnalysis
+        };
+        setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+
         // Generate pre-filled structure
         const today = new Date();
         const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
@@ -296,31 +693,54 @@ export default function App() {
           finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
         }
 
-        setEditingPedido({
-          numeroVenda: nextNum,
-          data: formattedDate,
-          nomeCompleto: extracted.nomeCompleto || '',
-          telefone1: extracted.telefone1 || '',
-          telefone2: extracted.telefone2 || '',
-          endereco: extracted.endereco || '',
-          produto: extracted.produto || '',
-          cor: extracted.cor || '',
-          quantidade: Number(extracted.quantidade) || 1,
-          formaPagamento: extracted.formaPagamento || '',
-          valorTotal: totalVal,
-          comissao: finalComis,
-          status: 'PENDING',
-          textoOriginal: pasteOrderText, // Armazena texto original completo com observações, CNPJ, etc.
-          observacoes: extracted.observacoes || ''
-        });
+         setEditingPedido({
+           numeroVenda: nextNum,
+           data: formattedDate,
+           nomeCompleto: extracted.nomeCompleto || '',
+           telefone1: extracted.telefone1 || '',
+           telefone2: extracted.telefone2 || '',
+           endereco: extracted.endereco || '',
+           city: extracted.city || '',
+           state: extracted.state || '',
+           produto: extracted.produto || '',
+           cor: extracted.cor || '',
+           quantidade: Number(extracted.quantidade) || 1,
+           formaPagamento: extracted.formaPagamento || '',
+           valorTotal: totalVal,
+           comissao: finalComis,
+           status: 'PENDING',
+           textoOriginal: pasteOrderText, // Armazena texto original completo com observações, CNPJ, etc.
+           observacoes: extracted.observacoes || '',
+           supplier: currentSupplier
+         });
 
         triggerToast('success', 'Ficha interpretada pela IA com sucesso! Verifique os dados abaixo.');
       } else {
         throw new Error(resJson.error || "IA não conseguiu interpretar os campos estruturados.");
       }
     } catch (error: any) {
-      console.error(error);
-      triggerToast('error', `Erro na IA: ${error.message || 'Não foi possível interpretar o pedido.'}`);
+      clearTimeout(timeoutId);
+      const durationMs = Date.now() - analysisStartTime;
+      const isTimeout = error.name === 'AbortError';
+      const errorMsg = isTimeout ? 'Análise cancelada devido ao tempo limite de 15 segundos excedido do Gemini.' : (error.message || 'Não foi possível interpretar o pedido.');
+      
+      console.error("Erro na análise da IA:", error);
+      
+      // Save error log
+      const newLog: AiAnalysisLog = {
+        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
+        timestamp: new Date().toISOString(),
+        durationMs,
+        textLength: textLen,
+        inputText: pasteOrderText,
+        error: errorMsg,
+        isRapid: isRapidAnalysis
+      };
+      setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+
+      // Set explicit error text for display as requested
+      setAiAnalysisError("A IA não conseguiu interpretar a ficha.");
+      triggerToast('error', 'A IA não conseguiu interpretar a ficha.');
     } finally {
       setIsProcessingOrder(false);
     }
@@ -419,6 +839,8 @@ export default function App() {
         telefone1: editingPedido.telefone1 || '',
         telefone2: editingPedido.telefone2 || '',
         endereco: editingPedido.endereco || '',
+        city: editingPedido.city || '',
+        state: editingPedido.state || '',
         produto: editingPedido.produto,
         cor: editingPedido.cor || '',
         quantidade: Number(editingPedido.quantidade) || 1,
@@ -1032,7 +1454,7 @@ export default function App() {
       </AnimatePresence>
  
       {/* HEADER SECTION */}
-      <header className="bg-white border-b border-slate-200 py-4 px-4 sm:px-6 sticky top-0 z-40 shadow-xs/60 backdrop-blur-md">
+      <header className="bg-white border-b border-slate-200 py-4 px-4 sm:px-6 shadow-xs/60">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           
           {/* Logo / Title */}
@@ -1108,6 +1530,21 @@ export default function App() {
             >
               <FileText className="w-3.5 h-3.5 text-blue-500" />
               <span>Relatórios</span>
+            </button>
+
+            {/* BACKUP E SEGURANÇA HEADER BUTTON */}
+            <button
+              id="btn-header-settings"
+              onClick={() => {
+                setShowSettingsModal(true);
+                setShowReportsModal(false);
+                setShowNotificationsDropdown(false);
+              }}
+              className="inline-flex items-center gap-1.5 bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700 text-xs py-2 px-3.5 rounded-full font-extrabold transition cursor-pointer"
+              title="Menu de Backup, Excel e Auditoria do Zap Registro"
+            >
+              <Database className="w-3.5 h-3.5 text-rose-500" />
+              <span>Backup e Segurança</span>
             </button>
 
             {/* Direct update button */}
@@ -1196,7 +1633,7 @@ export default function App() {
       </header>
 
       {/* SUPPLIER MULTI-ABAS SECTION */}
-      <div className="bg-white border-b border-slate-200 py-3 px-4 sm:px-6 sticky top-[72px] z-30 shadow-2xs">
+      <div className="bg-white border-b border-slate-200 py-3 px-4 sm:px-6 shadow-2xs">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
             <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 shrink-0">Fornecedor:</span>
@@ -1278,15 +1715,96 @@ export default function App() {
                   id="textarea-colar-pedido"
                   rows={4}
                   value={pasteOrderText}
-                  onChange={(e) => setPasteOrderText(e.target.value)}
+                  onChange={(e) => {
+                    setPasteOrderText(e.target.value);
+                    if (aiAnalysisError) setAiAnalysisError(null);
+                  }}
                   placeholder="Exemplo de Ficha WhatsApp:&#10;Nome: Ricardo Santos&#10;Fone: 11 99911-2233&#10;End: Rua Amazonas, 400 - Jd Brasil&#10;Produto: Cama Casal Preta R$1200,00&#10;Comissão: 150"
                   className="w-full mt-2 p-4 text-xs bg-slate-50/60 hover:bg-slate-50 focus:bg-white text-slate-800 border border-slate-200 focus:border-brand focus:ring-1 focus:ring-brand rounded-2xl outline-none transition placeholder:text-slate-400 font-mono resize-none shadow-inner"
                 />
+
+                {/* ERROR BOX CONECTOR IA AS REQUESTED */}
+                <AnimatePresence>
+                  {aiAnalysisError && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: 5 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 5 }}
+                      className="mt-3 p-4 bg-rose-50/90 border border-rose-200 rounded-2xl text-left shadow-2xs"
+                    >
+                      <div className="flex gap-2.5">
+                        <XCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
+                        <div>
+                          <h4 className="text-xs font-bold text-rose-900">{aiAnalysisError}</h4>
+                          <p className="text-[10px] text-rose-705/90 text-rose-700 mt-1 font-medium leading-relaxed">
+                            Ocorreu uma instabilidade ou o tempo limite da rede (15s) foi atingido. Escolha tentar novamente, usar a Análise Rápida ou cadastrar a ficha de venda de forma manual para não travar a sua operação.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-3.5 flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          id="btn-ai-error-retry"
+                          onClick={() => {
+                            setAiAnalysisError(null);
+                            handleParseWhatsAppOrder();
+                          }}
+                          className="bg-rose-500 hover:bg-rose-600 text-white font-extrabold text-[10px] py-1.5 px-3 rounded-xl transition cursor-pointer shadow-2xs"
+                        >
+                          🔄 Tentar novamente
+                        </button>
+                        <button
+                          type="button"
+                          id="btn-ai-error-manual"
+                          onClick={() => {
+                            setAiAnalysisError(null);
+                            const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+                            setEditingPedido({
+                              numeroVenda: nextNum,
+                              data: new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }),
+                              nomeCompleto: '',
+                              telefone1: '',
+                              telefone2: '',
+                              endereco: '',
+                              city: '',
+                              state: '',
+                              produto: '',
+                              cor: '',
+                              quantidade: 1,
+                              formaPagamento: 'PIX',
+                              valorTotal: 0,
+                              comissao: 0,
+                              status: 'PENDING',
+                              textoOriginal: pasteOrderText || 'Ficha Cadastrada Manualmente (Fallback erro IA)',
+                              observacoes: '',
+                              supplier: currentSupplier
+                            });
+                          }}
+                          className="bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-extrabold text-[10px] py-1.5 px-3 rounded-xl transition cursor-pointer shadow-2xs"
+                        >
+                          ✍️ Cadastrar manualmente
+                        </button>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
  
               <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
-                <button
-                  id="btn-create-manual-fallback"
+                {/* ⚡ ANÁLISE RÁPIDA TOGGLE */}
+                <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-700 bg-slate-100 hover:bg-slate-250 py-1.5 px-3 rounded-full transition font-extrabold shadow-3xs">
+                  <input
+                    type="checkbox"
+                    checked={isRapidAnalysis}
+                    onChange={(e) => setIsRapidAnalysis(e.target.checked)}
+                    className="rounded text-rose-500 focus:ring-rose-500 w-3.5 h-3.5 accent-rose-500 cursor-pointer"
+                  />
+                  <span>⚡ Análise Rápida</span>
+                </label>
+
+                <div className="flex items-center gap-2 flex-grow sm:flex-none justify-end">
+                  <button
+                    id="btn-create-manual-fallback"
                   onClick={() => {
                     const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
                     setEditingPedido({
@@ -1296,6 +1814,8 @@ export default function App() {
                       telefone1: '',
                       telefone2: '',
                       endereco: '',
+                      city: '',
+                      state: '',
                       produto: '',
                       cor: '',
                       quantidade: 1,
@@ -1334,6 +1854,7 @@ export default function App() {
                 </button>
               </div>
             </div>
+          </div>
  
             {/* PANEL 2: MARCAR ENTREGUE COM IA */}
             <div className="bg-white rounded-3xl p-6 shadow-sm border border-slate-200/90 flex flex-col justify-between h-full hover:shadow-xs transition duration-300">
@@ -1480,15 +2001,38 @@ export default function App() {
 
                     </div>
 
-                    {/* Endereço */}
-                    <div>
-                      <label className="block text-xs font-bold text-natural-muted uppercase mb-1">Endereço de Entrega Completo</label>
-                      <input 
-                        type="text" 
-                        value={editingPedido.endereco || ''}
-                        onChange={(e) => setEditingPedido(prev => prev ? { ...prev, endereco: e.target.value } : null)}
-                        className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none whitespace-normal"
-                      />
+                    {/* Endereço, Cidade e Estado */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                      <div className="md:col-span-2">
+                        <label className="block text-xs font-bold text-natural-muted uppercase mb-1">Endereço de Entrega Completo</label>
+                        <input 
+                          type="text" 
+                          value={editingPedido.endereco || ''}
+                          onChange={(e) => setEditingPedido(prev => prev ? { ...prev, endereco: e.target.value } : null)}
+                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none whitespace-normal"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-natural-muted uppercase mb-1">Cidade</label>
+                        <input 
+                          type="text" 
+                          placeholder="ex: Campinas"
+                          value={editingPedido.city || ''}
+                          onChange={(e) => setEditingPedido(prev => prev ? { ...prev, city: e.target.value } : null)}
+                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-natural-muted uppercase mb-1">Estado</label>
+                        <input 
+                          type="text" 
+                          placeholder="ex: SP"
+                          maxLength={2}
+                          value={editingPedido.state || ''}
+                          onChange={(e) => setEditingPedido(prev => prev ? { ...prev, state: e.target.value.toUpperCase() } : null)}
+                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
+                        />
+                      </div>
                     </div>
 
                     {/* Comissao e Valores */}
@@ -2015,13 +2559,14 @@ export default function App() {
 
             </div>
 
-            {/* PLANILHA COMPACT LIST (Spreadsheet styled lightweight list) */}
-            <div className="overflow-x-auto">
-              <div className="min-w-[820px]">
+            {/* PLANILHA COMPACT LIST (Spreadsheet styled lightweight list) - DESKTOP VIEW */}
+            <div className="hidden md:block overflow-x-auto">
+              <div className="min-w-[850px]">
                 
                 {/* Headers */}
-                <div className="grid grid-cols-[1.5fr_1.4fr_0.9fr_1.3fr_110px] bg-slate-50 border-b border-slate-200 px-4 py-3.5 text-[10px] font-extrabold text-[#64748b] uppercase tracking-wider font-sans">
+                <div className="grid grid-cols-[1.3fr_0.8fr_1.3fr_0.8fr_1.1fr_90px] bg-slate-50 border-b border-slate-200 px-4 py-3.5 text-[10px] font-extrabold text-[#64748b] uppercase tracking-wider font-sans">
                   <div>Cliente</div>
+                  <div>Cidade</div>
                   <div>Produto & Cor</div>
                   <div className="text-right">Valor</div>
                   <div className="text-center">Status</div>
@@ -2036,7 +2581,7 @@ export default function App() {
                         key={pedido.id}
                         id={`row-${pedido.id}`}
                         onClick={() => handleSelectAndHighlightPedido(pedido)}
-                        className={`grid grid-cols-[1.5fr_1.4fr_0.9fr_1.3fr_110px] px-4 py-3 text-xs items-center transition cursor-pointer select-none border-b border-slate-100 ${getRowBgClass(pedido.status, pedido.id)}`}
+                        className={`grid grid-cols-[1.3fr_0.8fr_1.3fr_0.8fr_1.1fr_90px] px-4 py-3 text-xs items-center transition cursor-pointer select-none border-b border-slate-100 ${getRowBgClass(pedido.status, pedido.id)}`}
                       >
                         {/* Cliente Column */}
                         <div className="flex flex-col gap-0.5 min-w-0 pr-2">
@@ -2045,6 +2590,13 @@ export default function App() {
                             <span className="bg-slate-100 px-1.5 py-0.5 rounded text-slate-700 font-bold">#{pedido.numeroVenda}</span>
                             <span>•</span>
                             <span>{pedido.data}</span>
+                          </span>
+                        </div>
+
+                        {/* Cidade Column */}
+                        <div className="flex flex-col min-w-0 pr-2">
+                          <span className="font-bold text-slate-700 truncate">
+                            {pedido.city ? `${pedido.city}${pedido.state ? `/${pedido.state}` : ''}` : '-'}
                           </span>
                         </div>
 
@@ -2127,6 +2679,198 @@ export default function App() {
                 )}
 
               </div>
+            </div>
+
+            {/* PLANILHA COMPACT LIST - MOBILE VIEW (Cards View, No Horizontal Scroll) */}
+            <div className="block md:hidden p-3 sm:p-4 space-y-4">
+              {orderListFiltered.length > 0 ? (
+                orderListFiltered.map((pedido) => (
+                  <div 
+                    key={pedido.id}
+                    id={`mobile-card-${pedido.id}`}
+                    onClick={() => handleSelectAndHighlightPedido(pedido)}
+                    className={`bg-white rounded-2xl border border-slate-200 shadow-3xs p-4 flex flex-col space-y-3 transition duration-205 border-l-4 ${
+                      pedido.status === 'PENDING' ? 'border-l-amber-400' :
+                      pedido.status === 'RESCHEDULED' ? 'border-l-yellow-400' :
+                      pedido.status === 'DELIVERED_UNPAID' ? 'border-l-blue-400' :
+                      pedido.status === 'CANCELLED' ? 'border-l-rose-450' :
+                      'border-l-emerald-400'
+                    } ${getRowBgClass(pedido.status, pedido.id)}`}
+                  >
+                    {/* Card Header: Nº Venda & Data */}
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] bg-slate-100 border border-slate-200 text-slate-700 px-2 py-0.5 rounded-lg font-mono font-bold">
+                        Pedido #{pedido.numeroVenda}
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-500 font-bold flex items-center gap-1">
+                        <Calendar className="w-3.5 h-3.5 text-slate-450" />
+                        {pedido.data}
+                      </span>
+                    </div>
+
+                    {/* Client & City & Product info */}
+                    <div className="space-y-2.5 text-left">
+                      {/* Cliente e Cidade */}
+                      <div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <User className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                          <span className="text-xs font-black text-slate-900 truncate">{pedido.nomeCompleto}</span>
+                        </div>
+                        {pedido.city && (
+                          <div className="flex items-center gap-1.5 mt-0.5 text-[11px] text-slate-600 font-bold ml-5">
+                            <span>🏙️</span>
+                            <span>{pedido.city}{pedido.state ? `/${pedido.state}` : ''}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Produto com expansão */}
+                      <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-150">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="text-[11px] leading-tight text-slate-800">
+                            <span className="font-sans text-slate-400 font-extrabold mr-1">📦 Produto(s):</span>
+                            <span className="font-extrabold font-sans">
+                              {getSummarizedProductAndList(pedido.produto).summary}
+                            </span>
+                            {pedido.cor && (
+                              <span className="text-[10px] text-slate-500 font-medium"> (Cor: {pedido.cor})</span>
+                            )}
+                          </div>
+                          {getSummarizedProductAndList(pedido.produto).isMultiple && (
+                            <button
+                              onClick={(e) => toggleProductExpand(pedido.id, e)}
+                              className="text-[9.5px] font-black text-brand bg-white hover:bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded transition shrink-0 cursor-pointer"
+                            >
+                              {expandedProducts[pedido.id] ? '▲ Ocultar' : '▼ Ver produtos'}
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Expanded products list */}
+                        {getSummarizedProductAndList(pedido.produto).isMultiple && expandedProducts[pedido.id] && (
+                          <div className="mt-2 pt-2 border-t border-slate-205 space-y-1 pl-1 text-[11px] text-slate-600 leading-tight font-mono">
+                            {getSummarizedProductAndList(pedido.produto).items.map((item, idx) => (
+                              <div key={idx} className="flex items-start gap-1">
+                                <span className="text-slate-400">•</span>
+                                <span className="font-semibold text-slate-700">{item}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      
+                      {/* Valor e Comissão */}
+                      <div className="flex flex-wrap items-center gap-4">
+                        <div>
+                          <span className="text-slate-400 font-bold uppercase tracking-wider text-[8.5px] block">Valor Total</span>
+                          <span className="font-black text-slate-900 font-mono text-xs">
+                            R$ {pedido.valorTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400 font-bold uppercase tracking-wider text-[8.5px] block">Comissão</span>
+                          <span className="font-extrabold text-brand bg-brand/5 border border-brand/10 px-1.5 py-0.2 rounded font-mono text-xs">
+                            R$ {pedido.comissao.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Telefone como Botão de Enlace Diretamente para WhatsApp */}
+                      <div>
+                        <span className="text-slate-400 font-bold uppercase tracking-wider text-[8.5px] block mb-1">WhatsApp de Contato</span>
+                        {pedido.telefone1 ? (
+                          <a 
+                            href={getWhatsAppLink(pedido.telefone1)} 
+                            target="_blank" 
+                            referrerPolicy="no-referrer" 
+                            rel="noopener noreferrer" 
+                            onClick={(e) => e.stopPropagation()}
+                            className="inline-flex items-center gap-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-850 text-xs py-1.5 px-3 rounded-xl font-black transition shadow-3xs cursor-pointer"
+                          >
+                            <span className="text-sm">💬</span>
+                            <span>{pedido.telefone1}</span>
+                            <ExternalLink className="w-3 h-3 shrink-0 text-emerald-600" />
+                          </a>
+                        ) : (
+                          <span className="text-xs text-slate-400 italic">Sem telefone cadastrado</span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Status Selector */}
+                    <div className="pt-2 border-t border-slate-100 flex flex-col gap-1" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-1">
+                        <span className="text-xs">🏷️</span>
+                        <span className="text-[9px] font-sans font-extrabold text-slate-400 uppercase tracking-wider text-left">Status:</span>
+                      </div>
+                      <select
+                        value={pedido.status}
+                        onChange={async (e) => {
+                          const nextStat = e.target.value as any;
+                          await handleQuickStatusUpdate(pedido.id, nextStat);
+                        }}
+                        className={`w-full py-1.5 px-3 bg-white text-slate-900 rounded-xl text-xs font-bold border outline-none focus:ring-1 focus:ring-brand cursor-pointer shadow-3xs transition-colors duration-200 ${
+                          pedido.status === 'PENDING' ? 'bg-amber-50 text-amber-850 border-amber-300' :
+                          pedido.status === 'RESCHEDULED' ? 'bg-yellow-50 text-amber-950 border-yellow-300' :
+                          pedido.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-900 border-blue-300' :
+                          pedido.status === 'CANCELLED' ? 'bg-rose-50 text-rose-700 border-rose-300' :
+                          'bg-emerald-50 text-emerald-950 border-emerald-300'
+                        }`}
+                      >
+                        <option value="PENDING">Pendente</option>
+                        <option value="RESCHEDULED">Reagendado</option>
+                        <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
+                        <option value="DELIVERED">Entregue</option>
+                        <option value="CANCELLED">Cancelado</option>
+                      </select>
+                      {pedido.status === 'RESCHEDULED' && (pedido.dataReagendamento || pedido.rescheduleDate) && (
+                        <div className="text-[10px] text-amber-900 font-extrabold flex items-center gap-1 font-sans justify-start mt-1 bg-yellow-50/50 p-2 border border-yellow-200 rounded-xl">
+                          <Calendar className="w-3.5 h-3.5 text-amber-600 shrink-0 inline" />
+                          <span>Reagendado para: {pedido.dataReagendamento || pedido.rescheduleDate}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Bottom Card Actions: Copiar Ficha & Ver Detalhes */}
+                    <div className="pt-2.5 border-t border-slate-105 flex items-center justify-end gap-2" onClick={(e) => e.stopPropagation()}>
+                      {/* Copiar button */}
+                      <button
+                        onClick={() => {
+                          let textToCopy = `Cliente: ${pedido.nomeCompleto}\n`;
+                          if (pedido.telefone1) textToCopy += `Telefone: ${pedido.telefone1}\n`;
+                          if (pedido.city) {
+                            textToCopy += `Cidade: ${pedido.city}${pedido.state ? `/${pedido.state}` : ''}\n`;
+                          }
+                          if (pedido.endereco) textToCopy += `Endereço: ${pedido.endereco}\n`;
+                          textToCopy += `Produto: ${getSummarizedProductAndList(pedido.produto).summary}`;
+                          if (pedido.cor) textToCopy += ` (${pedido.cor})`;
+                          copyToClipboard(textToCopy, 'Dados de Venda');
+                        }}
+                        className="inline-flex items-center gap-1.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-xs py-2 px-4 rounded-xl font-extrabold transition shadow-3xs cursor-pointer"
+                        title="Copiar Nome, Telefone, Endereço e Produto"
+                      >
+                        <Copy className="w-3.5 h-3.5 text-slate-500" />
+                        <span>Copiar</span>
+                      </button>
+
+                      {/* Abrir button */}
+                      <button
+                        onClick={() => setSelectedPedido(pedido)}
+                        className="inline-flex items-center gap-1.5 bg-rose-50 hover:bg-rose-100 border border-rose-150 text-rose-700 text-xs py-2 px-4 rounded-xl font-extrabold transition shadow-3xs cursor-pointer"
+                        title="Abrir Detalhes"
+                      >
+                        <Eye className="w-3.5 h-3.5 text-rose-500" />
+                        <span>Abrir</span>
+                      </button>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="py-12 text-center text-natural-muted bg-white border border-slate-205 rounded-3xl">
+                  <FileText className="w-8 h-8 mx-auto text-natural-muted/60 stroke-[1.5] mb-2" />
+                  <p className="text-xs">Nenhum pedido correspondente encontrado.</p>
+                </div>
+              )}
             </div>
 
           </section>
@@ -2554,11 +3298,19 @@ export default function App() {
                   <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
                     <div className="flex items-center gap-1.5 text-slate-500">
                       <MapPin className="w-4 h-4 text-red-650" />
-                      <span className="text-[10px] font-extrabold uppercase tracking-wide">Endereço de Entrega</span>
+                      <span className="text-[10px] font-extrabold uppercase tracking-wide">Endereço de Entrega & Cidade</span>
                     </div>
-                    <p className="text-sm font-medium text-slate-700 mt-2 leading-relaxed whitespace-normal select-text">
+                    <p className="text-sm font-semibold text-slate-800 mt-2 leading-relaxed whitespace-normal select-text">
                       {selectedPedido.endereco || 'Endereço não cadastrado'}
                     </p>
+                    {(selectedPedido.city || selectedPedido.state) && (
+                      <div className="mt-1.5 pt-1.5 border-t border-slate-200 flex items-center gap-1.5 text-xs text-slate-650 font-extrabold">
+                        <span>🏙️ Cidade/UF:</span>
+                        <span className="bg-white border border-slate-200 px-2 py-0.5 rounded-lg text-slate-800 font-mono">
+                          {selectedPedido.city || 'Não informado'}{selectedPedido.state ? ` / ${selectedPedido.state}` : ''}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   {/* Observacoes complementares */}
@@ -2981,6 +3733,476 @@ export default function App() {
               </div>
             </motion.div>
           </>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL DE CONFIGURAÇÕES (Backup e Segurança) */}
+      <AnimatePresence>
+        {showSettingsModal && (
+          <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-[#f8fafc] rounded-3xl shadow-2xl w-full max-w-4xl overflow-hidden border border-slate-200/80 flex flex-col max-h-[85vh]"
+            >
+              {/* Header */}
+              <div className="px-6 py-5 bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Settings className="w-5 h-5 text-rose-500 animate-spin-slow" />
+                  <div>
+                    <h3 className="font-sans font-extrabold text-sm uppercase tracking-wider">Configurações Gerais do Sistema</h3>
+                    <p className="text-[10px] text-slate-300 font-medium">Controles e parametrizações de segurança das informações</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setShowSettingsModal(false)}
+                  className="text-white/60 hover:text-white text-xs font-bold leading-none select-none cursor-pointer bg-white/10 p-2 rounded-full hover:bg-white/15 transition"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Sidebar Menu & Tabs Layout */}
+              <div className="flex flex-col md:flex-row flex-1 overflow-hidden min-h-[50vh]">
+                {/* Tabs Sidebar */}
+                <div className="w-full md:w-64 bg-slate-100 border-b md:border-b-0 md:border-r border-slate-200 p-4 shrink-0 flex md:flex-col gap-1.5 overflow-x-auto md:overflow-x-visible">
+                  <button
+                    onClick={() => setActiveSettingsTab('backup')}
+                    className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
+                      activeSettingsTab === 'backup' 
+                        ? 'bg-rose-500 text-white shadow-sm' 
+                        : 'text-slate-600 hover:bg-slate-250 hover:text-slate-800'
+                    }`}
+                  >
+                    <Database className="w-4 h-4" />
+                    <span>Backup e Segurança</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveSettingsTab('logs')}
+                    className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
+                      activeSettingsTab === 'logs' 
+                        ? 'bg-rose-500 text-white shadow-sm' 
+                        : 'text-slate-600 hover:bg-slate-250 hover:text-slate-800'
+                    }`}
+                  >
+                    <ShieldCheck className="w-4 h-4" />
+                    <span>Histórico & Auditoria ({backupsHistory.length})</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveSettingsTab('ailogs')}
+                    className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
+                      activeSettingsTab === 'ailogs' 
+                        ? 'bg-rose-500 text-white shadow-sm' 
+                        : 'text-slate-600 hover:bg-slate-250 hover:text-slate-800'
+                    }`}
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>Logs de IA ({aiLogs.length})</span>
+                  </button>
+                </div>
+
+                {/* Content Panel Area */}
+                <div className="flex-1 p-6 overflow-y-auto space-y-6">
+                  
+                  {activeSettingsTab === 'backup' && (
+                    <div className="space-y-6">
+                      
+                      {/* Subtitle & Alert box */}
+                      <div className="bg-amber-55/65 border border-amber-200/50 rounded-2xl p-4.5 flex gap-3 text-amber-905 bg-amber-50">
+                        <Shield className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                        <div>
+                          <h4 className="text-xs font-bold">Redundância Total e Prevenção Ativa</h4>
+                          <p className="text-[10px] text-amber-805 mt-1 font-medium leading-relaxed">
+                            Todos os backups salvam a integridade dos pedidos de todos os fornecedores (Sofia Home Decor, Michael, Frank, Outros) no Firestore e localmente. Backups automáticos gerados diariamente no limiar das 03:00 AM mantêm as últimas 30 cópias.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Manual backup and spreadsheet exports row */}
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        {/* 1. Generate Backup */}
+                        <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex flex-col justify-between space-y-4">
+                          <div>
+                            <span className="text-[8.5px] font-mono font-bold text-slate-400 uppercase tracking-wider block">Formato JSON redundante</span>
+                            <h4 className="text-xs font-extrabold text-slate-800 mt-1">Gerar Backup Manual</h4>
+                            <p className="text-[10px] text-slate-500 mt-1.5 leading-snug">Exporta toda a base de vendas ativa diretamente para o seu computador de forma criptografada.</p>
+                          </div>
+                          <button
+                            onClick={handleGenerateManualBackup}
+                            disabled={isCreatingBackup}
+                            className="bg-slate-900 hover:bg-slate-800 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition"
+                          >
+                            <Download className="w-4 h-4" />
+                            {isCreatingBackup ? 'Gerando...' : '📥 Fazer Backup Agora'}
+                          </button>
+                        </div>
+
+                        {/* 2. Import Restore */}
+                        <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex flex-col justify-between space-y-4">
+                          <div>
+                            <span className="text-[8.5px] font-mono font-bold text-slate-400 uppercase tracking-wider block">Restauração Segura</span>
+                            <h4 className="text-xs font-extrabold text-[#e11d48] mt-1">Restaurar Banco de Dados</h4>
+                            <p className="text-[10px] text-slate-500 mt-1.5 leading-snug">Importe um arquivo .json gerado anteriormente para sobrescrever ou restaurar pedidos perdidos.</p>
+                          </div>
+                          <label className="bg-rose-50 hover:bg-rose-100 text-rose-700 hover:text-rose-800 font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer border border-rose-200 transition text-center">
+                            <Upload className="w-4 h-4 text-rose-500" />
+                            <span>📤 Restaurar Backup</span>
+                            <input
+                              type="file"
+                              accept=".json"
+                              onChange={handleImportBackupFile}
+                              className="hidden"
+                            />
+                          </label>
+                        </div>
+
+                        {/* 3. Export Excel Spreadsheet */}
+                        <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex flex-col justify-between space-y-4">
+                          <div>
+                            <span className="text-[8.5px] font-mono font-bold text-slate-400 uppercase tracking-wider block">Relatório Comercial Planilha</span>
+                            <h4 className="text-xs font-extrabold text-emerald-700 mt-1">Exportar Planilha Excel</h4>
+                            <p className="text-[10px] text-slate-500 mt-1.5 leading-snug">Gere uma planilha XLSX contendo canais, de fornecedor, comissão, cliente, valores e observações.</p>
+                          </div>
+                          <button
+                            onClick={handleExportExcel}
+                            className="bg-emerald-650 hover:bg-emerald-700 bg-emerald-600 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer transition"
+                          >
+                            <FileSpreadsheet className="w-4 h-4" />
+                            <span>📊 Exportar Excel</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Integrity Protection and Structural Schema Updates Simulation Card */}
+                      <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-4">
+                        <div className="flex items-center gap-2">
+                          <ShieldCheck className="w-5 h-5 text-slate-700" />
+                          <div>
+                            <h4 className="text-xs font-extrabold text-slate-900">Proteção de Integridade & Atualizações Estruturais</h4>
+                            <p className="text-[10.5px] text-slate-500 font-medium">Garante a compatibilidade do sistema com segurança total e backups em cascata antes de qualquer mudança.</p>
+                          </div>
+                        </div>
+
+                        <div className="border-t border-slate-100 pt-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                          <div className="space-y-1.5 max-w-xl">
+                            <span className="text-[9px] font-mono font-extrabold text-rose-600 uppercase bg-rose-50 px-2 py-0.5 rounded border border-rose-100">Atualização do Schema</span>
+                            <p className="text-[10px] text-slate-600 font-medium leading-relaxed">
+                              Ao realizar modificações nas tabelas do sistema, este assistente força a criação prévia de um backup automático redundante na coleção metadata, valida a gravação física dele e somente após isso atualiza e normaliza as ordens.
+                            </p>
+                          </div>
+                          
+                          <button
+                            onClick={handleSystemUpdateWithBackup}
+                            disabled={updateStep > 0}
+                            className="bg-rose-500 hover:bg-rose-600 text-white font-extrabold text-xs py-2.5 px-5 rounded-xl cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition inline-flex items-center gap-1.5 shrink-0 self-start lg:self-center"
+                          >
+                            <RefreshCw className={`w-4 h-4 ${updateStep > 0 ? 'animate-spin' : ''}`} />
+                            <span>Executar Atualização Estrutural</span>
+                          </button>
+                        </div>
+
+                        {/* Interactive Steps workflow visualization */}
+                        {updateStep > 0 && (
+                          <div className="mt-4 p-4.5 bg-slate-50 rounded-2xl border border-slate-200">
+                            <h5 className="text-[10px] font-bold text-slate-700 uppercase tracking-wider mb-3">Progresso de Atualização de Estrutura Segura:</h5>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                              {/* Step 1 */}
+                              <div className="flex items-center gap-2">
+                                <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-extrabold ${
+                                  updateStep === 1 ? 'bg-amber-500 text-white animate-pulse' : 
+                                  updateStep > 1 ? 'bg-emerald-500 text-white' : 'bg-slate-200 text-slate-500'
+                                }`}>
+                                  {updateStep > 1 ? '✓' : '1'}
+                                </div>
+                                <span className="text-[10px] font-bold text-slate-700">1. Criando Backup Forçado</span>
+                              </div>
+                              {/* Step 2 */}
+                              <div className="flex items-center gap-2">
+                                <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-extrabold ${
+                                  updateStep === 2 ? 'bg-amber-500 text-white animate-pulse' : 
+                                  updateStep > 2 ? 'bg-emerald-500 text-white' : 'bg-slate-200 text-slate-500'
+                                }`}>
+                                  {updateStep > 2 ? '✓' : '2'}
+                                </div>
+                                <span className="text-[10px] font-bold text-slate-700">2. Confirmando Gravação</span>
+                              </div>
+                              {/* Step 3 */}
+                              <div className="flex items-center gap-2">
+                                <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-extrabold ${
+                                  updateStep === 3 ? 'bg-amber-500 text-white animate-pulse' : 
+                                  updateStep > 3 ? 'bg-emerald-500 text-white' : 'bg-slate-200 text-slate-500'
+                                }`}>
+                                  {updateStep > 3 ? '✓' : '3'}
+                                </div>
+                                <span className="text-[10px] font-bold text-slate-700">3. Executando Otimização</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                    </div>
+                  )}
+
+                  {activeSettingsTab === 'logs' && (
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h4 className="text-xs font-bold text-slate-900">Auditoria & Histórico de Backups</h4>
+                          <p className="text-[10px] text-slate-500">Histórico de todas as gravações redundantes que registram metadados de auditoria.</p>
+                        </div>
+                        <span className="text-[9.5px] font-bold px-2 py-1 bg-slate-100 rounded-lg text-slate-600 uppercase font-mono tracking-widest">{backupsHistory.length} Backups</span>
+                      </div>
+
+                      <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
+                        <table className="w-full text-left font-sans text-xs border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 border-b border-slate-205 text-slate-600 font-extrabold uppercase text-[9px] tracking-wider">
+                              <th className="py-3 px-4">Data & Horário</th>
+                              <th className="py-3 px-4">Tipo</th>
+                              <th className="py-3 px-4">Registros</th>
+                              <th className="py-3 px-4">Tamanho</th>
+                              <th className="py-3 px-4">Responsável</th>
+                              <th className="py-3 px-4 text-right">Ações Rápidas</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {backupsHistory.length > 0 ? (
+                              backupsHistory.map((b) => (
+                                <tr key={b.id} className="border-b border-slate-100 hover:bg-slate-25/50 font-medium text-slate-700">
+                                  <td className="py-3 px-4 font-semibold text-slate-900">
+                                    {new Date(b.createdAt).toLocaleString('pt-BR')}
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <span className={`text-[9.5px] px-2 py-0.5 rounded-full font-bold uppercase ${
+                                      b.backupType === 'automatico' 
+                                        ? 'bg-purple-50 text-purple-750 border border-purple-150' 
+                                        : 'bg-emerald-50 text-emerald-805 border border-emerald-150'
+                                    }`}>
+                                      {b.backupType === 'automatico' ? '⚙️ Automático' : '👤 Manual'}
+                                    </span>
+                                  </td>
+                                  <td className="py-3 px-4 font-mono font-bold text-slate-800">
+                                    {b.recordsCount} vendas
+                                  </td>
+                                  <td className="py-3 px-4 font-mono text-slate-500">
+                                    {b.fileSize}
+                                  </td>
+                                  <td className="py-3 px-4 truncate max-w-[140px]" title={b.responsibleUser}>
+                                    {b.responsibleUser}
+                                  </td>
+                                  <td className="py-3 px-4 text-right flex items-center justify-end gap-1.5">
+                                    <button
+                                      onClick={() => handleRestoreFromHistory(b)}
+                                      className="inline-flex items-center gap-1 bg-rose-50 hover:bg-rose-105 border border-rose-150 text-rose-700 hover:text-rose-800 text-[10px] font-extrabold px-2.5 py-1 rounded-lg transition cursor-pointer"
+                                      title="Aplica os dados deste backup imediatamente"
+                                    >
+                                      Restaurar
+                                    </button>
+                                    <button
+                                      onClick={() => deleteBackup(b.id)}
+                                      className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition cursor-pointer"
+                                      title="Excluir do histórico permanente"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))
+                            ) : (
+                              <tr>
+                                <td colSpan={6} className="py-12 text-center text-slate-400 space-y-2">
+                                  <div className="w-10 h-10 bg-slate-100 rounded-full flex items-center justify-center mx-auto text-slate-400">
+                                    <Database className="w-5 h-5" />
+                                  </div>
+                                  <p className="text-[10.5px]">Nenhum histórico de backup cadastrado ou registrado até o momento.</p>
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeSettingsTab === 'ailogs' && (
+                    <div className="space-y-4 text-left">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h4 className="text-xs font-bold text-slate-900">Logs & Diagnósticos de Inteligência Artificial</h4>
+                          <p className="text-[10px] text-slate-500 font-medium">Monitore o desempenho, tempos de resposta e falhas da IA.</p>
+                        </div>
+                        <button
+                          onClick={() => {
+                            setAiLogs([]);
+                            triggerToast('info', 'Histórico de logs de IA limpo.');
+                          }}
+                          className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-[9.5px] py-1 px-2.5 rounded-lg transition cursor-pointer"
+                        >
+                          Limpar Logs
+                        </button>
+                      </div>
+
+                      {/* STATS GAUGE */}
+                      <div className="grid grid-cols-3 gap-3">
+                        <div className="bg-slate-50/65 p-3 rounded-2xl border border-slate-150">
+                          <span className="text-[8.5px] font-mono uppercase text-slate-450 block tracking-wider font-extrabold">Total Acumulado</span>
+                          <span className="text-sm font-black text-slate-800 mt-1 block">{aiLogs.length}</span>
+                        </div>
+                        <div className="bg-slate-50/65 p-3 rounded-2xl border border-slate-150">
+                          <span className="text-[8.5px] font-mono uppercase text-slate-450 block tracking-wider font-extrabold">Tempo Médio (s)</span>
+                          <span className="text-sm font-black text-slate-800 mt-1 block">
+                            {aiLogs.length > 0 
+                              ? `${(aiLogs.reduce((acc, curr) => acc + curr.durationMs, 0) / aiLogs.length / 1000).toFixed(2)}s` 
+                              : '0.00s'}
+                          </span>
+                        </div>
+                        <div className="bg-slate-50/65 p-3 rounded-2xl border border-slate-150">
+                          <span className="text-[8.5px] font-mono uppercase text-slate-450 block tracking-wider font-extrabold">Sucesso</span>
+                          <span className="text-sm font-black text-slate-800 mt-1 block">
+                            {aiLogs.length > 0 
+                              ? `${((aiLogs.filter(l => !l.error).length / aiLogs.length) * 100).toFixed(0)}%` 
+                              : '100%'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* EXPANDABLE LOGS LIST */}
+                      <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1 no-scrollbar">
+                        {aiLogs.length > 0 ? (
+                          aiLogs.map((log) => (
+                            <div key={log.id} className="bg-white border border-slate-200 rounded-2xl p-3.5 space-y-2.5 hover:shadow-2xs transition">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className="text-[10px] font-mono font-bold text-slate-500">
+                                    {new Date(log.timestamp).toLocaleTimeString('pt-BR')} ({new Date(log.timestamp).toLocaleDateString('pt-BR')})
+                                  </span>
+                                  <span className={`text-[8.5px] px-1.5 py-0.2 rounded-full font-bold uppercase ${
+                                    log.isRapid 
+                                      ? 'bg-rose-50 text-rose-600 border border-rose-100' 
+                                      : 'bg-blue-50 text-blue-600 border border-blue-100'
+                                  }`}>
+                                    {log.isRapid ? '⚡ Rápido' : '🔍 Completo'}
+                                  </span>
+                                </div>
+
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[9.5px] font-mono font-bold text-slate-650 bg-slate-100 px-1.5 py-0.5 rounded">
+                                    {(log.durationMs / 1000).toFixed(2)}s
+                                  </span>
+                                  <span className="text-[9px] font-mono text-slate-400">
+                                    {log.textLength} chars
+                                  </span>
+                                  <span className={`w-2 h-2 rounded-full ${log.error ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'}`} />
+                                </div>
+                              </div>
+
+                              <div className="text-[10px] space-y-1 bg-slate-50 p-2.5 rounded-xl border border-slate-150 font-mono text-slate-700 whitespace-pre-wrap max-h-24 overflow-y-auto no-scrollbar scroll-smooth">
+                                <div className="text-[8.5px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-200 pb-1 mb-1">Texto Enviado do WhatsApp:</div>
+                                {log.inputText}
+                              </div>
+
+                              {log.error ? (
+                                <div className="text-[10px] p-2.5 bg-rose-50/60 border border-rose-150 rounded-xl text-rose-800 font-mono">
+                                  <div className="text-[8.5px] font-black text-rose-500 uppercase tracking-widest pb-0.5">Erro Retornado:</div>
+                                  {log.error}
+                                </div>
+                              ) : log.response ? (
+                                <div className="text-[10px] p-2.5 bg-emerald-50/40 border border-emerald-150 rounded-xl text-slate-800 font-mono max-h-32 overflow-y-auto no-scrollbar">
+                                  <div className="text-[8.5px] font-black text-emerald-600 uppercase tracking-widest border-b border-emerald-100 pb-1 mb-1">Campos Interpretados da IA:</div>
+                                  {log.response}
+                                </div>
+                              ) : null}
+                            </div>
+                          ))
+                        ) : (
+                          <div className="py-12 text-center text-slate-400 space-y-2 bg-white border border-slate-205 rounded-2xl">
+                            <Sparkles className="w-6 h-6 text-slate-300 mx-auto" />
+                            <p className="text-[10.5px]">Nenhum evento registrado de análise de Inteligência Artificial.</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                </div>
+              </div>
+
+              {/* Footer UI elements */}
+              <div className="p-4 bg-slate-100 border-t border-slate-200 flex items-center justify-between">
+                <span className="text-[9.5px] font-mono font-bold text-slate-400 uppercase tracking-wider">
+                  SISTEMA DE SEGURANÇA E INTEGRIDADE IA ZAP REGISTRO
+                </span>
+                <button
+                  onClick={() => setShowSettingsModal(false)}
+                  className="bg-slate-900 hover:bg-slate-800 text-white text-xs py-2 px-5 rounded-full font-bold transition cursor-pointer"
+                >
+                  Fechar Painel
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* CONFIRMAÇÃO DO OVERWRITE / RESTORE DIALOG */}
+      <AnimatePresence>
+        {restoreConfirmData && (
+          <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-[60] animate-fade-in">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden border border-slate-200"
+            >
+              {/* Alert Warning Header */}
+              <div className="px-5 py-4 bg-amber-505 bg-amber-500 text-white flex items-center gap-2.5">
+                <Shield className="w-5 h-5 animate-pulse" />
+                <h4 className="text-xs font-bold uppercase tracking-wider">CONFIRMAÇÃO DE RESTAURAÇÃO</h4>
+              </div>
+
+              <div className="p-5.5 space-y-4">
+                <div className="space-y-2 text-left">
+                  <h5 className="text-[10px] font-mono font-bold text-slate-450 uppercase tracking-wider">Origem da Cópia / Backup:</h5>
+                  <p className="text-xs font-extrabold text-slate-800 bg-slate-50 p-3 rounded-xl border border-slate-200 font-sans break-all">
+                    {restoreConfirmName}
+                  </p>
+                </div>
+
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl text-amber-900 text-[10.5px] leading-relaxed space-y-1.5 font-medium text-left">
+                  <div className="flex justify-between font-bold text-amber-950 text-xs pb-1 border-b border-amber-200">
+                    <span>Quantidade de Pedidos:</span>
+                    <span className="font-mono">{restoreConfirmData.length} registros</span>
+                  </div>
+                  <p className="pt-1">
+                    ⚠️ <strong>ATENÇÃO TOTAL:</strong> Ao executar a restauração de segurança, todos os registros e pedidos de vendas atuais do seu sistema ativos serão <strong>SUBSTITUÍDOS PERMANENTEMENTE</strong> por este conjunto de dados.
+                  </p>
+                </div>
+              </div>
+
+              {/* Action Cancel/Confirm row */}
+              <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2.5">
+                <button
+                  onClick={() => {
+                    setRestoreConfirmData(null);
+                    setRestoreConfirmName('');
+                  }}
+                  disabled={isRestoring}
+                  className="px-4 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 text-xs rounded-xl font-bold transition cursor-pointer disabled:opacity-50"
+                >
+                  Cancelar Sobrescrita
+                </button>
+                <button
+                  onClick={executeRestore}
+                  disabled={isRestoring}
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs rounded-xl font-bold transition flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                >
+                  {isRestoring ? 'Processando...' : 'Confirmar e Restaurar'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
 

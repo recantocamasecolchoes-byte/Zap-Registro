@@ -92,12 +92,57 @@
         "status",
         "textoOriginal"
       ]
+    },
+    "backupMetadata": {
+      "title": "BackupMetadata",
+      "description": "Metadados de backup e segurança de vendas",
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data e hora em que o backup foi gerado"
+        },
+        "recordsCount": {
+          "type": "integer",
+          "description": "Quantidade total de pedidos contidos no backup"
+        },
+        "responsibleUser": {
+          "type": "string",
+          "description": "E-mail do vendedor ou termo 'sistema' responsável pelo backup"
+        },
+        "fileSize": {
+          "type": "string",
+          "description": "Tamanho legível do arquivo de backup (ex: 24.5 KB)"
+        },
+        "backupType": {
+          "type": "string",
+          "enum": ["manual", "automatico"],
+          "description": "Origem do backup (manual por clique, ou automático diário)"
+        },
+        "backupData": {
+          "type": "string",
+          "description": "JSON completo contendo a lista dos pedidos em formato de texto"
+        }
+      },
+      "required": [
+        "createdAt",
+        "recordsCount",
+        "responsibleUser",
+        "fileSize",
+        "backupType",
+        "backupData"
+      ]
     }
   },
   "firestore": {
     "orders/{orderId}": {
       "schema": "pedido",
       "description": "Coleção de pedidos cadastrados por vendedores de móveis"
+    },
+    "system_backups/{backupId}": {
+      "schema": "backupMetadata",
+      "description": "Coleção de metadados e arquivos de backup automático/manual salvos no sistema"
     }
   }
 }
