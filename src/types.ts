@@ -34,4 +34,17 @@ export interface AiAnalysisLog {
   error?: string;
   response?: string;
   isRapid: boolean;
+  supplier?: string;
+  modelUsed?: string;
+  errorCode?: string | number;
 }
+
+export interface ExcludedOrderBackup {
+  id: string; // unique exclusion ID
+  deletedAtDate: string; // DD/MM/YYYY
+  deletedAtTime: string; // HH:mm
+  deletedBy: string; // email/user
+  supplier: string; // supplier
+  pedidoCompleto: Pedido; // full Pedido object
+}
+

@@ -155,6 +155,8 @@ export function subscribePedidos(
           telefone1: d.telefone1 || '',
           telefone2: d.telefone2 || '',
           endereco: d.endereco || '',
+          city: d.city || '',
+          state: d.state || '',
           produto: d.produto || '',
           cor: d.cor || '',
           quantidade: d.quantidade || 1,
@@ -211,6 +213,84 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): 
     (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
     (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
 
+  // Normalize city and state
+  let cityInput = (pedido.city || '').trim();
+  let stateInput = (pedido.state || '').trim().toUpperCase();
+
+  const isRetiradaText = (txt: string) => {
+    if (!txt) return false;
+    const norm = txt.toLowerCase();
+    return norm.includes("retirada") || 
+           norm.includes("retirar") || 
+           norm.includes("retira na loja") || 
+           norm.includes("retirada na fábrica") || 
+           norm.includes("retirada na fabrica") || 
+           norm.includes("cliente retira") || 
+           norm.includes("retirada no local");
+  };
+
+  const matchesRetirada = 
+    isRetiradaText(cityInput) || 
+    isRetiradaText(pedido.endereco || '') || 
+    isRetiradaText(pedido.observacoes || '') || 
+    isRetiradaText(pedido.textoOriginal || '');
+
+  if (matchesRetirada) {
+    cityInput = "RETIRADA";
+    stateInput = "";
+  } else if (!cityInput) {
+    // If not found in cityInput, let's check if endereco contains a city/state format like "Alfenas/MG" or "Alfenas - MG"
+    const addr = pedido.endereco || '';
+    const match = addr.match(/,\s*([^,]+?)\s*[\/-]\s*([A-Za-z]{2})/);
+    if (match) {
+      cityInput = match[1].trim();
+      stateInput = match[2].trim().toUpperCase();
+      if (isRetiradaText(cityInput)) {
+        cityInput = "RETIRADA";
+        stateInput = "";
+      }
+    }
+  }
+
+  // Double check some common raw texts in address, such as "Alfenas/MG" or "Campinas/SP" or "Varginha" or "São Paulo"
+  if (!cityInput || cityInput === "NÃO INFORMADO") {
+    const fullText = `${pedido.endereco || ''} ${pedido.textoOriginal || ''}`.toLowerCase();
+    if (fullText.includes("alfenas")) {
+      cityInput = "Alfenas";
+      stateInput = "MG";
+    } else if (fullText.includes("poços de caldas") || fullText.includes("pocos de caldas")) {
+      cityInput = "Poços de Caldas";
+      stateInput = "MG";
+    } else if (fullText.includes("varginha")) {
+      cityInput = "Varginha";
+      stateInput = "MG";
+    } else if (fullText.includes("guaxupé") || fullText.includes("guaxupe")) {
+      cityInput = "Guaxupé";
+      stateInput = "MG";
+    } else if (fullText.includes("passos")) {
+      cityInput = "Passos";
+      stateInput = "MG";
+    } else if (fullText.includes("campinas")) {
+      cityInput = "Campinas";
+      stateInput = "SP";
+    } else if (fullText.includes("são paulo") || fullText.includes("sao paulo")) {
+      cityInput = "São Paulo";
+      stateInput = "SP";
+    }
+  }
+
+  // Capitalize first letters of city unless it is RETIRADA or NÃO INFORMADO
+  if (cityInput && cityInput !== "RETIRADA" && cityInput !== "NÃO INFORMADO") {
+    cityInput = cityInput
+      .split(' ')
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+      .join(' ');
+  }
+
+  if (!cityInput) {
+    cityInput = "NÃO INFORMADO";
+  }
+
   const payload: any = {
     numeroVenda: pedido.numeroVenda,
     data: pedido.data,
@@ -218,6 +298,8 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): 
     telefone1: pedido.telefone1,
     telefone2: pedido.telefone2,
     endereco: pedido.endereco,
+    city: cityInput,
+    state: stateInput,
     produto: pedido.produto,
     cor: pedido.cor,
     quantidade: Number(pedido.quantidade) || 1,
@@ -357,17 +439,24 @@ export async function updatePedidoStatus(
  * Deletes a Pedido
  */
 export async function deletePedido(id: string): Promise<void> {
+  console.log("[DEBUG deletePedido] Iniciando exclusão de pedido no Firebase/LocalStorage. ID:", id);
+  console.log("[DEBUG deletePedido] Firebase configurado:", isFirebaseConfigured, "DB ativo:", !!db);
   if (isFirebaseConfigured && db) {
     try {
       const docRef = doc(db, "orders", id);
+      console.log("[DEBUG deletePedido] Referência criada com sucesso para caminho:", docRef.path);
       await deleteDoc(docRef);
+      console.log("[DEBUG deletePedido] Exclusão executada com sucesso no Firestore.");
     } catch (err: any) {
+      console.error("[DEBUG deletePedido] Erro ao deletar documento no Firestore:", err);
       handleFirestoreError(err, OperationType.DELETE, `orders/${id}`);
     }
   } else {
+    console.log("[DEBUG deletePedido] Usando modo offline / LocalStorage.");
     const list = getLocalStoragePedidos();
     const filtered = list.filter(p => p.id !== id);
     setLocalStoragePedidos(filtered);
+    console.log("[DEBUG deletePedido] LocalStorage atualizado, linhas restantes:", filtered.length);
   }
 }
 
@@ -585,6 +674,8 @@ export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<
           telefone1: p.telefone1 || '',
           telefone2: p.telefone2 || '',
           endereco: p.endereco || '',
+          city: p.city || '',
+          state: p.state || '',
           produto: p.produto || '',
           cor: p.cor || '',
           quantidade: Number(p.quantidade) || 1,
@@ -616,3 +707,165 @@ export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<
     setLocalStoragePedidos(restoredPedidos);
   }
 }
+
+export interface ExcludedOrderBackup {
+  id: string; // unique exclusion ID
+  deletedAtDate: string; // DD/MM/YYYY
+  deletedAtTime: string; // HH:mm
+  deletedBy: string; // email/user
+  supplier: string; // supplier
+  pedidoCompleto: Pedido; // full Pedido object
+}
+
+// In-memory list when offline, backed by LocalStorage
+let currentOfflineExclusions: ExcludedOrderBackup[] = [];
+
+function getLocalStorageExclusions(): ExcludedOrderBackup[] {
+  const data = localStorage.getItem("iazap_vendas_excluidas");
+  if (!data) return [];
+  try {
+    currentOfflineExclusions = JSON.parse(data);
+    return currentOfflineExclusions;
+  } catch (e) {
+    return [];
+  }
+}
+
+function setLocalStorageExclusions(items: ExcludedOrderBackup[]) {
+  currentOfflineExclusions = [...items];
+  localStorage.setItem("iazap_vendas_excluidas", JSON.stringify(items));
+  window.dispatchEvent(new Event("iazap_exclusions_update"));
+}
+
+const exclusionsLocalListeners: Set<(exclusions: ExcludedOrderBackup[]) => void> = new Set();
+if (typeof window !== "undefined") {
+  window.addEventListener("iazap_exclusions_update", () => {
+    const fresh = getLocalStorageExclusions();
+    exclusionsLocalListeners.forEach(listener => listener(fresh));
+  });
+}
+
+/**
+ * Subscribes to real-time updates for Excluded Vendas (Administradores)
+ */
+export function subscribeExcludedOrders(
+  onUpdate: (exclusions: ExcludedOrderBackup[]) => void,
+  onError: (error: any) => void
+): () => void {
+  if (isFirebaseConfigured && db) {
+    const q = query(collection(db, "system_exclusions"), orderBy("deletedAtDate", "desc"));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list: ExcludedOrderBackup[] = [];
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        list.push({
+          id: docSnap.id,
+          deletedAtDate: d.deletedAtDate || '',
+          deletedAtTime: d.deletedAtTime || '',
+          deletedBy: d.deletedBy || '',
+          supplier: d.supplier || '',
+          pedidoCompleto: d.pedidoCompleto || null
+        });
+      });
+      onUpdate(list);
+    }, (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, "system_exclusions");
+      } catch (formattedError: any) {
+        onError(formattedError);
+      }
+    });
+    return unsubscribe;
+  } else {
+    // LocalStorage Mode
+    const list = getLocalStorageExclusions();
+    onUpdate(list);
+    
+    const localCallback = (freshList: ExcludedOrderBackup[]) => {
+      onUpdate(freshList);
+    };
+    exclusionsLocalListeners.add(localCallback);
+    return () => {
+      exclusionsLocalListeners.delete(localCallback);
+    };
+  }
+}
+
+/**
+ * Excludes a sale with backup registration (Histórico de Exclusões)
+ */
+export async function excludeOrderWithBackup(
+  pedido: Pedido,
+  deletedByUser: string
+): Promise<void> {
+  console.log("[DEBUG excludeOrderWithBackup] Iniciando excludeOrderWithBackup.");
+  console.log("[DEBUG excludeOrderWithBackup] Pedido a ser excluído:", pedido);
+  console.log("[DEBUG excludeOrderWithBackup] Excluído por:", deletedByUser);
+
+  if (!pedido || !pedido.id) {
+    console.error("[DEBUG excludeOrderWithBackup] Erro: Pedido inválido ou ID ausente!");
+    throw new Error("Não é possível excluir uma venda sem ID válido.");
+  }
+
+  const finalId = `exclusion-${Date.now()}`;
+  const now = new Date();
+  
+  const payload: Omit<ExcludedOrderBackup, "id"> = {
+    deletedAtDate: now.toLocaleDateString('pt-BR'),
+    deletedAtTime: now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+    deletedBy: deletedByUser || 'Administrador',
+    supplier: pedido.supplier || 'OUTROS',
+    pedidoCompleto: pedido
+  };
+
+  console.log("[DEBUG excludeOrderWithBackup] Payload de exclusão preparado:", payload);
+
+  // 1. Save Backup in system_exclusions
+  if (isFirebaseConfigured && db) {
+    try {
+      console.log("[DEBUG excludeOrderWithBackup] Salvando backup no Firestore na coleção 'system_exclusions', ID:", finalId);
+      const exclusionDocRef = doc(db, "system_exclusions", finalId);
+      await setDoc(exclusionDocRef, payload);
+      console.log("[DEBUG excludeOrderWithBackup] Backup de exclusão salvo com sucesso no Firestore.");
+    } catch (err: any) {
+      console.error("[DEBUG excludeOrderWithBackup] Erro ao gravar backup de exclusão no Firestore:", err);
+      handleFirestoreError(err, OperationType.CREATE, `system_exclusions/${finalId}`);
+    }
+  } else {
+    console.log("[DEBUG excludeOrderWithBackup] Salvando backup de exclusão em LocalStorage (Offline).");
+    const list = getLocalStorageExclusions();
+    list.push({ ...payload, id: finalId });
+    setLocalStorageExclusions(list);
+    console.log("[DEBUG excludeOrderWithBackup] Backup salvo em LocalStorage com sucesso.");
+  }
+
+  // 2. Delete from active sales
+  console.log("[DEBUG excludeOrderWithBackup] Deletando pedido original:", pedido.id);
+  await deletePedido(pedido.id);
+  console.log("[DEBUG excludeOrderWithBackup] Exclusão e backup concluídos com sucesso.");
+}
+
+/**
+ * Restores a previously excluded sale back to the orders list
+ */
+export async function restoreExcludedOrderToSystem(
+  backup: ExcludedOrderBackup
+): Promise<void> {
+  const p = backup.pedidoCompleto;
+  await savePedido(p);
+
+  // 2. Remove from exclusions list
+  if (isFirebaseConfigured && db) {
+    try {
+      const docRef = doc(db, "system_exclusions", backup.id);
+      await deleteDoc(docRef);
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.DELETE, `system_exclusions/${backup.id}`);
+    }
+  } else {
+    const list = getLocalStorageExclusions();
+    const filtered = list.filter(b => b.id !== backup.id);
+    setLocalStorageExclusions(filtered);
+  }
+}
+

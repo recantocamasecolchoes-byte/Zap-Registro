@@ -39,8 +39,8 @@ const pedidoSchema = {
     telefone1: { type: Type.STRING, description: "Telefone de contato preferencial (exemplo: (11) 99999-9999)." },
     telefone2: { type: Type.STRING, description: "Telefone de contato secundário, se houver. Caso contrário, deixar em branco." },
     endereco: { type: Type.STRING, description: "Endereço completo para entrega do móvel." },
-    city: { type: Type.STRING, description: "Cidade extraída do endereço ou do contexto do pedido (ex: Campinas, Poços de Caldas, São Paulo, Alfenas). Se não encontrar, deixar em branco." },
-    state: { type: Type.STRING, description: "Sigla do estado (UF) de 2 letras em maiúsculo (ex: SP, MG). Se não encontrar, deixar em branco." },
+    city: { type: Type.STRING, description: "Cidade extraída do endereço, CEP, Bairro, conversa ou contexto. Se houver termos de retirada como 'Retirada', 'Retirar', 'Retira na loja', 'Retirada na fábrica', 'Cliente retira' ou 'Retirada no local', retorne exatamente a palavra 'RETIRADA'. Se não houver nada, retorne 'NÃO INFORMADO'." },
+    state: { type: Type.STRING, description: "Sigla do estado (UF) de 2 letras em maiúsculo (ex: SP, MG). Se não encontrar ou for RETIRADA, deixar em branco." },
     produto: { type: Type.STRING, description: "Nome do produto/móvel." },
     cor: { type: Type.STRING, description: "Cor ou estampa do produto/móvel, se mencionada." },
     quantidade: { type: Type.INTEGER, description: "Quantidade vendida. Se não for especificada, o padrão é 1." },
@@ -57,8 +57,8 @@ const rapidPedidoSchema = {
   properties: {
     nomeCompleto: { type: Type.STRING, description: "Nome completo do comprador." },
     telefone1: { type: Type.STRING, description: "Telefone de contato preferencial." },
-    city: { type: Type.STRING, description: "Cidade extraída do endereço ou do contexto do pedido. Se não encontrar, retornar string vazia." },
-    state: { type: Type.STRING, description: "Sigla do estado com 2 letras em maiúsculo (ex: SP, MG). Se não encontrar, retornar string vazia." },
+    city: { type: Type.STRING, description: "Cidade extraída do endereço ou do contexto do pedido. Se houver termos de retirada do móvel (ex: Retirada, Retirar, Retira na loja, Retirada na fábrica, Cliente retira, Retirada no local), retorne exatamente a palavra 'RETIRADA'. Se não houver nada, retorne 'NÃO INFORMADO'." },
+    state: { type: Type.STRING, description: "Sigla do estado com 2 letras em maiúsculo (ex: SP, MG). Se não encontrar ou for RETIRADA, retornar vazio." },
     produto: { type: Type.STRING, description: "Nome do produto/móvel." },
     formaPagamento: { type: Type.STRING, description: "Forma de pagamento." },
     valorTotal: { type: Type.NUMBER, description: "Valor de venda. Se não encontrar, retorne 0." }
@@ -90,7 +90,7 @@ Ficha de entrada:
 Ficha de entrada:
 "${text}"`;
       schemaToUse = pedidoSchema;
-      systemInstruction = "Você é um assistente administrativo de logística em uma fábrica de móveis. Extraia as informações estruturadas de mensagens textuais do WhatsApp com precisão. Se dados específicos como telefones ou cor faltarem, retorne string vazia. O valorTotal e comissaoSugerida devem ser puros números decimais.";
+      systemInstruction = "Você é um assistente administrativo de logística em uma fábrica de móveis. Extraia as informações estruturadas de mensagens textuais do WhatsApp com precisão. Preste muita atenção na identificação da cidade e estado (UF) no endereço, CEP, Bairro, contexto do pedido ou texto da conversa. Identifique com precisão se é um caso de RETIRADA (e.g. 'Retirada', 'Retirar', 'Retira na loja', 'Retirada na fábrica', 'Cliente retira', 'Retirada no local') e nesse caso preencha city como 'RETIRADA' e state vazio. Se nenhuma informação de cidade/retirada for encontrada de forma alguma, preencha city como 'NÃO INFORMADO'.";
     }
 
     const response = await ai.models.generateContent({

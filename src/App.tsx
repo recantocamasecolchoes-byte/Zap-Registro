@@ -42,10 +42,11 @@ import {
   Download,
   Upload,
   Shield,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Zap
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Pedido, AiAnalysisLog } from './types';
+import { Pedido, AiAnalysisLog, ExcludedOrderBackup } from './types';
 import { 
   subscribePedidos, 
   savePedido, 
@@ -57,7 +58,10 @@ import {
   subscribeBackupHistory,
   deleteBackup,
   restoreBackupToSystem,
-  BackupItem
+  BackupItem,
+  subscribeExcludedOrders,
+  excludeOrderWithBackup,
+  restoreExcludedOrderToSystem
 } from './dbService';
 import * as XLSX from 'xlsx';
 import { 
@@ -206,8 +210,14 @@ export default function App() {
   
   // AI Options and Logging
   const [isRapidAnalysis, setIsRapidAnalysis] = useState<boolean>(() => {
-    return localStorage.getItem('iazap_is_rapid') === 'true';
+    const val = localStorage.getItem('iazap_is_rapid');
+    return val === null ? true : val === 'true';
   });
+  
+  // Admin Role, Exclusions, and Spreadsheet tabs
+  const [isAdminMode, setIsAdminMode] = useState<boolean>(true);
+  const [excludedOrders, setExcludedOrders] = useState<ExcludedOrderBackup[]>([]);
+  const [activeSpreadsheetTab, setActiveSpreadsheetTab] = useState<'ativos' | 'excluidos'>('ativos');
   const [aiAnalysisError, setAiAnalysisError] = useState<string | null>(null);
   const [aiLogs, setAiLogs] = useState<AiAnalysisLog[]>(() => {
     try {
@@ -217,6 +227,89 @@ export default function App() {
       return [];
     }
   });
+
+  // IA Consumption Control and Patterns Memory States
+  const [aiDiagnostics, setAiDiagnostics] = useState(() => {
+    try {
+      const stored = localStorage.getItem('iazap_ai_diagnostics');
+      return stored ? JSON.parse(stored) : {
+        totalAnalises: 0,
+        resolvidaSemIa: 0,
+        enviadaGemini: 0,
+        sucesso: 0,
+        erros: 0
+      };
+    } catch {
+      return {
+        totalAnalises: 0,
+        resolvidaSemIa: 0,
+        enviadaGemini: 0,
+        sucesso: 0,
+        erros: 0
+      };
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('iazap_ai_diagnostics', JSON.stringify(aiDiagnostics));
+  }, [aiDiagnostics]);
+
+  const [learnedPatterns, setLearnedPatterns] = useState(() => {
+    try {
+      const stored = localStorage.getItem('iazap_learned_patterns');
+      return stored ? JSON.parse(stored) : {
+        cities: ["Alfenas", "Varginha", "Poços de Caldas", "Três Corações", "Guaxupé", "Passos", "Campinas", "São Paulo"],
+        products: ["Cama Box Casal", "Cama Queen", "Sofá Atenas", "Sofá Dubai"],
+        paymentMethods: ["PIX", "DINHEIRO", "CARTÃO", "CREDITO", "BOLETO", "DEBITO", "CHEQUE"]
+      };
+    } catch {
+      return {
+        cities: ["Alfenas", "Varginha", "Poços de Caldas", "Três Corações", "Guaxupé", "Passos", "Campinas", "São Paulo"],
+        products: ["Cama Box Casal", "Cama Queen", "Sofá Atenas", "Sofá Dubai"],
+        paymentMethods: ["PIX", "DINHEIRO", "CARTÃO", "CREDITO", "BOLETO", "DEBITO", "CHEQUE"]
+      };
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('iazap_learned_patterns', JSON.stringify(learnedPatterns));
+  }, [learnedPatterns]);
+
+  const registerNewPatterns = (p: Partial<Pedido> | Pedido) => {
+    setLearnedPatterns(prev => {
+      const updated = { ...prev };
+      let changed = false;
+
+      if (p.city && p.city !== 'RETIRADA' && p.city !== 'NÃO INFORMADO' && p.city.trim().length > 2) {
+        const cityCapitalized = p.city.trim().split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+        if (!updated.cities.includes(cityCapitalized)) {
+          updated.cities = [...updated.cities, cityCapitalized].slice(-100);
+          changed = true;
+        }
+      }
+
+      if (p.produto && p.produto !== 'Produto não identificado' && p.produto.trim().length > 3) {
+        const prodTrim = p.produto.trim();
+        if (!updated.products.includes(prodTrim)) {
+          updated.products = [...updated.products, prodTrim].slice(-100);
+          changed = true;
+        }
+      }
+
+      if (p.formaPagamento && p.formaPagamento.trim().length > 2) {
+        const pgNormalized = p.formaPagamento.trim().toUpperCase();
+        if (!updated.paymentMethods.includes(pgNormalized)) {
+          updated.paymentMethods = [...updated.paymentMethods, pgNormalized].slice(-30);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        return updated;
+      }
+      return prev;
+    });
+  };
 
   useEffect(() => {
     localStorage.setItem('iazap_is_rapid', String(isRapidAnalysis));
@@ -309,6 +402,20 @@ export default function App() {
       (error) => {
         console.error("Backup history subscribe error: ", error);
         triggerToast('error', `Erro ao ler histórico de backups: ${parseFirebaseError(error)}`);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Subscribe to excluded orders real-time updates
+  useEffect(() => {
+    const unsubscribe = subscribeExcludedOrders(
+      (list) => {
+        setExcludedOrders(list);
+      },
+      (error) => {
+        console.error("Exclusions subscribe error: ", error);
+        triggerToast('error', `Erro ao ler histórico de exclusões: ${parseFirebaseError(error)}`);
       }
     );
     return () => unsubscribe();
@@ -632,6 +739,456 @@ export default function App() {
     }, 800);
   };
 
+  // PARSER DE EMERGÊNCIA SEM IA USANDO REGEX E CACHE LOCAL
+  const parseWhatsAppOrderWithRegex = (text: string) => {
+    const norm = text.toLowerCase();
+    
+    // 1. Detect if it is RETIRADA
+    const isRetiradaText = (txt: string) => {
+      const t = txt.toLowerCase();
+      return t.includes("retirada") || 
+             t.includes("retirar") || 
+             t.includes("retira na loja") || 
+             t.includes("retirada na fábrica") || 
+             t.includes("retirada na fabrica") || 
+             t.includes("cliente retira") || 
+             t.includes("retirada no local") ||
+             t.includes("retirada no depósito") ||
+             t.includes("retirada no deposito");
+    };
+
+    const isPhoneNumber = (str: string) => {
+      const clean = str.replace(/[+\s\(\)-]/g, '');
+      return /^\d+$/.test(clean) && clean.length >= 8 && clean.length <= 15;
+    };
+
+    const parseValue = (str: string) => {
+      if (!str) return 0;
+      let cleanVal = str.replace(/[^\d.,]/g, '').trim().replace(/\./g, '').replace(',', '.');
+      if ((cleanVal.match(/\./g) || []).length > 1) {
+        cleanVal = cleanVal.replace(/\.(?=[^.]*\.)/g, '');
+      }
+      return parseFloat(cleanVal) || 0;
+    };
+
+    // Identificar automaticamente qual modelo de ficha foi colado (PASSO 1)
+    const isSofia = norm.includes("dados do cliente") ||
+                    norm.includes("dados da compra") ||
+                    norm.includes("cpf/cnpj") ||
+                    norm.includes("valor do produto") ||
+                    norm.includes("valor total") ||
+                    norm.includes("forma de pagamento") ||
+                    norm.includes("sofia home decor");
+
+    if (isSofia) {
+      // -- EXTRAÇÃO SOFIA (Não utilizar interpretação livre - extrair exatamente por rótulos) --
+      const lines = text.split('\n');
+      let nomeCompleto = "";
+      let contato = "";
+      let cpfCnpj = "";
+      let endereco = "";
+      let localizacao = "";
+      let cor = "";
+      let tecido = "";
+      let valorProduto = "";
+      let frete = "";
+      let valorTotalVal = "";
+      let formaPagamentoVal = "";
+      let observacoesVal = "";
+      let vendedorVal = "";
+
+      const getValueAfterLabel = (line: string, label: string) => {
+        const idx = line.toLowerCase().indexOf(label.toLowerCase());
+        if (idx !== -1) {
+          return line.substring(idx + label.length).replace(/^[\s:=-]+/, '').trim();
+        }
+        return "";
+      };
+
+      for (const line of lines) {
+        const cleanLine = line.trim();
+        if (!cleanLine) continue;
+
+        if (cleanLine.toLowerCase().startsWith("nome completo")) {
+          nomeCompleto = getValueAfterLabel(cleanLine, "Nome Completo");
+        } else if (cleanLine.toLowerCase().startsWith("contato")) {
+          contato = getValueAfterLabel(cleanLine, "Contato");
+        } else if (cleanLine.toLowerCase().startsWith("cpf/cnpj") || cleanLine.toLowerCase().startsWith("cpf") || cleanLine.toLowerCase().startsWith("cnpj")) {
+          cpfCnpj = getValueAfterLabel(cleanLine, "CPF/CNPJ") || getValueAfterLabel(cleanLine, "CPF") || getValueAfterLabel(cleanLine, "CNPJ");
+        } else if (cleanLine.toLowerCase().startsWith("endereço") || cleanLine.toLowerCase().startsWith("endereco")) {
+          endereco = getValueAfterLabel(cleanLine, "Endereço") || getValueAfterLabel(cleanLine, "Endereco");
+        } else if (cleanLine.toLowerCase().startsWith("localização") || cleanLine.toLowerCase().startsWith("localizacao")) {
+          localizacao = getValueAfterLabel(cleanLine, "Localização") || getValueAfterLabel(cleanLine, "Localizacao");
+        } else if (cleanLine.toLowerCase().startsWith("cor")) {
+          cor = getValueAfterLabel(cleanLine, "Cor");
+        } else if (cleanLine.toLowerCase().startsWith("tecido")) {
+          tecido = getValueAfterLabel(cleanLine, "Tecido");
+        } else if (cleanLine.toLowerCase().startsWith("valor do produto") || cleanLine.toLowerCase().startsWith("valor produto")) {
+          valorProduto = getValueAfterLabel(cleanLine, "Valor do Produto") || getValueAfterLabel(cleanLine, "Valor Produto");
+        } else if (cleanLine.toLowerCase().startsWith("frete")) {
+          frete = getValueAfterLabel(cleanLine, "Frete");
+        } else if (cleanLine.toLowerCase().startsWith("valor total")) {
+          valorTotalVal = getValueAfterLabel(cleanLine, "Valor Total");
+        } else if (cleanLine.toLowerCase().startsWith("forma de pagamento") || cleanLine.toLowerCase().startsWith("forma pagamento")) {
+          formaPagamentoVal = getValueAfterLabel(cleanLine, "Forma de Pagamento") || getValueAfterLabel(cleanLine, "Forma pagamento");
+        } else if (cleanLine.toLowerCase().startsWith("observações") || cleanLine.toLowerCase().startsWith("observacoes")) {
+          observacoesVal = getValueAfterLabel(cleanLine, "Observações") || getValueAfterLabel(cleanLine, "Observacoes");
+        } else if (cleanLine.toLowerCase().startsWith("vendedor")) {
+          vendedorVal = getValueAfterLabel(cleanLine, "Vendedor");
+        }
+      }
+
+      // Map phone numbers
+      let fone1 = "";
+      let fone2 = "";
+      const phoneNumbers = contato.match(/(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?9\d{4}[-\s]?\d{4}/g) || 
+                           contato.match(/(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}/g) || [];
+      if (phoneNumbers.length > 0) {
+        fone1 = phoneNumbers[0].trim();
+      } else if (contato) {
+        fone1 = contato;
+      }
+      if (phoneNumbers.length > 1) {
+        fone2 = phoneNumbers[1].trim();
+      }
+
+      // Parse Localização for City and State
+      let city = "";
+      let state = "";
+      if (localizacao) {
+        const parts = localizacao.split(/[\/-]/);
+        city = parts[0].trim();
+        if (parts[1]) {
+          state = parts[1].trim().toUpperCase().substring(0, 2);
+        }
+      }
+
+      // Capitalize city
+      if (city) {
+        city = city.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+      }
+
+      // Fallback search in cache of cities
+      if (!city || city.toUpperCase() === "NÃO INFORMADO") {
+        let foundCityFromCache = "";
+        for (const c of learnedPatterns.cities) {
+          if (norm.includes(c.toLowerCase())) {
+            foundCityFromCache = c;
+            break;
+          }
+        }
+        if (foundCityFromCache) {
+          city = foundCityFromCache;
+          state = norm.includes("sp") ? "SP" : "MG";
+        }
+      }
+
+      // Product detection using cache or keywords
+      let produto = "";
+      let foundProductFromCache = "";
+      for (const p of learnedPatterns.products) {
+        if (norm.includes(p.toLowerCase())) {
+          foundProductFromCache = p;
+          break;
+        }
+      }
+      if (foundProductFromCache) {
+        produto = foundProductFromCache;
+      } else {
+        const keywords = ["cama", "colchão", "colchao", "cabeceira", "poltrona", "baú", "bau", "mdf", "sofá", "sofa", "painel", "guarda-roupa", "guarda roupa", "comoda"];
+        for (const kw of keywords) {
+          const idx = norm.indexOf(kw);
+          if (idx !== -1) {
+            const line = text.substring(idx).split('\n')[0].trim();
+            if (line.length > 3 && line.length < 100) {
+              produto = line;
+              break;
+            }
+          }
+        }
+        if (!produto) produto = "Produto não identificado";
+      }
+
+      let finalCor = cor;
+      if (tecido) {
+        finalCor = cor ? `${cor} (${tecido})` : tecido;
+      }
+
+      let valorTotal = parseValue(valorTotalVal) || parseValue(valorProduto);
+
+      let formaPagamento = "A combinar";
+      if (formaPagamentoVal) {
+        formaPagamento = formaPagamentoVal.toUpperCase();
+      } else {
+        let foundPaymentFromCache = "";
+        for (const m of learnedPatterns.paymentMethods) {
+          if (norm.includes(m.toLowerCase())) {
+            foundPaymentFromCache = m;
+            break;
+          }
+        }
+        if (foundPaymentFromCache) formaPagamento = foundPaymentFromCache;
+      }
+      if (formaPagamento === "A COMBINAR") formaPagamento = "A combinar";
+
+      let finalObsStr = "";
+      if (observacoesVal) finalObsStr += `Obs: ${observacoesVal}. `;
+      if (cpfCnpj) finalObsStr += `CPF/CNPJ: ${cpfCnpj}. `;
+      if (frete) finalObsStr += `Frete: ${frete}. `;
+      if (vendedorVal) finalObsStr += `Vendedor: ${vendedorVal}.`;
+
+      return {
+        nomeCompleto: nomeCompleto,
+        telefone1: fone1,
+        telefone2: fone2,
+        endereco: endereco,
+        city: city || "NÃO INFORMADO",
+        state: state || "MG",
+        produto: produto,
+        cor: finalCor,
+        quantidade: 1,
+        formaPagamento: formaPagamento,
+        valorTotal: valorTotal,
+        comissaoSugerida: 0,
+        observacoes: finalObsStr.trim() || "Extraído via Sofia Home Decor",
+        modelUsed: "SOFIA_HOME_DECOR"
+      };
+    } else {
+      // -- EXTRAÇÃO PADRÃO --
+      // Verificamos se há rótulos de chave-valor habituais (pelo menos dois termos com dois pontos ":" ou "=")
+      const labelMatchCount = (text.match(/:(?!\/)/g) || []).length;
+      const isSequential = labelMatchCount < 2;
+
+      let nome = "";
+      let fone1 = "";
+      let fone2 = "";
+      let endereco = "";
+      let city = "";
+      let state = "";
+      let produto = "";
+      let cor = "";
+      let quantidade = 1;
+      let formaPagamento = "A combinar";
+      let valorTotal = 0;
+      let comissaoSugerida = 0;
+      let observacoes = "";
+
+      if (isSequential) {
+        // Leitura prioriza rigidamente a sequência das informações mesmo sem cabeçalhos de rótulo (PASSO 2)
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        if (lines.length > 0) nome = lines[0];
+        
+        let nextIndex = 1;
+
+        if (lines.length > nextIndex) {
+          fone1 = lines[nextIndex];
+          nextIndex++;
+        }
+
+        if (lines.length > nextIndex) {
+          if (isPhoneNumber(lines[nextIndex])) {
+            fone2 = lines[nextIndex];
+            nextIndex++;
+          }
+        }
+
+        if (lines.length > nextIndex) {
+          endereco = lines[nextIndex];
+          nextIndex++;
+        }
+
+        if (lines.length > nextIndex) {
+          produto = lines[nextIndex];
+          nextIndex++;
+        }
+
+        if (lines.length > nextIndex) {
+          formaPagamento = lines[nextIndex];
+          nextIndex++;
+        }
+
+        if (lines.length > nextIndex) {
+          valorTotal = parseValue(lines[nextIndex]);
+          nextIndex++;
+        }
+
+        if (lines.length > nextIndex) {
+          const lineVal = lines[nextIndex];
+          if (lineVal.toLowerCase().includes("vendedor") || isNaN(Number(lineVal.replace(/[^\d]/g, "")))) {
+            observacoes = `Vendedor/Obs: ${lineVal}`;
+          } else {
+            comissaoSugerida = parseValue(lineVal);
+          }
+          nextIndex++;
+        }
+
+        if (lines.length > nextIndex) {
+          if (observacoes) {
+            observacoes += ` | Obs: ${lines[nextIndex]}`;
+          } else {
+            observacoes = lines[nextIndex];
+          }
+        }
+      } else {
+        // Extração por rótulos tradicionais com regex flexíveis
+        const nameMatch = text.match(/(?:nome|cliente|comprador|para|destinatário|destinatario)\s*[\s:=-]\s*([^\n]+)/i);
+        if (nameMatch) {
+          nome = nameMatch[1].trim();
+        } else {
+          const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+          const firstLine = lines[0] || "";
+          if (firstLine && firstLine.length < 50 && !firstLine.includes(':') && !firstLine.includes('=')) {
+            nome = firstLine;
+          }
+        }
+
+        const phoneNumbers = text.match(/(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?9\d{4}[-\s]?\d{4}/g) || 
+                             text.match(/(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}/g) || [];
+        if (phoneNumbers.length > 0) {
+          fone1 = phoneNumbers[0].trim();
+        }
+        if (phoneNumbers.length > 1) {
+          fone2 = phoneNumbers[1].trim();
+        }
+        if (!fone1) {
+          const foneMatch = text.match(/(?:fone|tel|telefone|whatsapp|cel|celular)\s*[\s:=-]\s*([^\n]+)/i);
+          if (foneMatch) fone1 = foneMatch[1].trim();
+        }
+
+        const endMatch = text.match(/(?:end|endereço|endereco|rua|av|local|entrega)\s*[\s:=-]\s*([^\n]+)/i);
+        if (endMatch) {
+          endereco = endMatch[1].trim();
+        }
+
+        const prodMatch = text.match(/(?:produto|prod|móvel|item|descrição|descricao|cama|sofá|colchão|poltrona|guarda-roupa|painel)\s*[\s:=-]\s*([^\n]+)/i);
+        if (prodMatch) {
+          produto = prodMatch[1].trim();
+        } else {
+          let foundProductFromCache = "";
+          for (const p of learnedPatterns.products) {
+            if (norm.includes(p.toLowerCase())) {
+              foundProductFromCache = p;
+              break;
+            }
+          }
+          if (foundProductFromCache) {
+            produto = foundProductFromCache;
+          } else {
+            const keywords = ["cama", "colchão", "colchao", "cabeceira", "poltrona", "baú", "bau", "mdf", "sofá", "sofa", "painel", "guarda-roupa", "guarda roupa", "comoda"];
+            for (const kw of keywords) {
+              const idx = norm.indexOf(kw);
+              if (idx !== -1) {
+                const line = text.substring(idx).split('\n')[0].trim();
+                if (line.length > 3 && line.length < 100) {
+                  produto = line;
+                  break;
+                }
+              }
+            }
+            if (!produto) produto = "Produto não identificado";
+          }
+        }
+
+        const corMatch = text.match(/(?:cor|estampa|tecido|revestimento)\s*[\s:=-]\s*([^\n]+)/i);
+        if (corMatch) cor = corMatch[1].trim();
+
+        const qtdMatch = text.match(/(?:quantidade|qtd|unidades|quant)\s*[\s:=-]\s*([0-9]+)/i);
+        if (qtdMatch) {
+          quantidade = parseInt(qtdMatch[1], 10) || 1;
+        }
+
+        const pgMatch = text.match(/(?:forma de pagamento|pagamento|pago via|pgto|forma pgto|forma)\s*[\s:=-]\s*([^\n]+)/i);
+        if (pgMatch) {
+          formaPagamento = pgMatch[1].trim().toUpperCase();
+        } else {
+          let foundPaymentFromCache = "";
+          for (const m of learnedPatterns.paymentMethods) {
+            if (norm.includes(m.toLowerCase())) {
+              foundPaymentFromCache = m;
+              break;
+            }
+          }
+          if (foundPaymentFromCache) formaPagamento = foundPaymentFromCache;
+        }
+
+        const valorMatch = text.match(/(?:valor|total|preço|preco|subtotal|venda)\s*[\s:=-]\s*(?:r\$)?\s*([\d.,]+)/i) || text.match(/(?:r\$)\s*([\d.,]+)/i);
+        if (valorMatch) {
+          valorTotal = parseValue(valorMatch[1]);
+        }
+
+        const comMatch = text.match(/(?:comissão|comissao|comisSugerida)\s*[\s:=-]\s*(?:r\$)?\s*([\d.,]+)/i);
+        if (comMatch) {
+          comissaoSugerida = parseValue(comMatch[1]);
+        }
+
+        const obsMatch = text.match(/(?:obs|observação|observacoes|observações|detalhes|cnpj)\s*[\s:=-]\s*([^\n]+)/i);
+        if (obsMatch) {
+          observacoes = obsMatch[1].trim();
+        }
+      }
+
+      // Detect city & state
+      if (isRetiradaText(text)) {
+        city = "RETIRADA";
+        state = "";
+      } else {
+        let foundCityFromCache = "";
+        for (const c of learnedPatterns.cities) {
+          if (norm.includes(c.toLowerCase())) {
+            foundCityFromCache = c;
+            break;
+          }
+        }
+
+        if (foundCityFromCache) {
+          city = foundCityFromCache;
+          state = norm.includes("sp") ? "SP" : "MG";
+        } else {
+          const matchLine = text.match(/(?:cidade|localidade|municipio)\s*[\s:=-]\s*([^\n]+)/i);
+          if (matchLine) {
+            const parts = matchLine[1].split(/[\/-]/);
+            city = parts[0].trim();
+            if (parts[1]) state = parts[1].trim().toUpperCase().substring(0, 2);
+          } else {
+            const addrToSearch = endereco || text;
+            const cityStateMatch = addrToSearch.match(/,\s*([^,]+?)\s*[\/-]\s*([A-Za-z]{2})/);
+            if (cityStateMatch) {
+              city = cityStateMatch[1].trim();
+              state = cityStateMatch[2].trim().toUpperCase().substring(0, 2);
+            }
+          }
+        }
+      }
+
+      if (city && city !== "RETIRADA" && city !== "NÃO INFORMADO") {
+        city = city.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+      }
+
+      if (!city) city = "NÃO INFORMADO";
+
+      if (formaPagamento === "A COMBINAR") {
+        formaPagamento = "A combinar";
+      }
+
+      return {
+        nomeCompleto: nome,
+        telefone1: fone1,
+        telefone2: fone2,
+        endereco: endereco,
+        city: city,
+        state: state || "MG",
+        produto: produto,
+        cor: cor,
+        quantidade: quantidade,
+        formaPagamento: formaPagamento,
+        valorTotal: valorTotal,
+        comissaoSugerida: comissaoSugerida,
+        observacoes: observacoes || "Extraído via Parser Padrão Local",
+        modelUsed: "PADRAO"
+      };
+    }
+  };
+
   // 1. CADASTRO INTELIGENTE DE PEDIDOS COM IA (WA Paste Interpreter)
   const handleParseWhatsAppOrder = async () => {
     if (!pasteOrderText.trim()) {
@@ -644,89 +1201,300 @@ export default function App() {
     const analysisStartTime = Date.now();
     const textLen = pasteOrderText.length;
 
-    // Create an abort controller for the 15 seconds timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, 15000);
+    // ETAPA 1 - PARSER LOCAL (PRIORIDADE MÁXIMA)
+    const localParsed = parseWhatsAppOrderWithRegex(pasteOrderText);
+    
+    if (isRapidAnalysis) {
+      const durationMs = Date.now() - analysisStartTime;
+      
+      const newLog: AiAnalysisLog = {
+        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
+        timestamp: new Date().toISOString(),
+        durationMs,
+        textLength: textLen,
+        inputText: pasteOrderText,
+        response: JSON.stringify(localParsed, null, 2),
+        isRapid: true,
+        supplier: currentSupplier,
+        modelUsed: "PARSER LOCAL (Modo Rápido)",
+        errorCode: "SUCCESS"
+      };
 
-    try {
-      const response = await fetch("/api/gemini/parse-pedido", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: pasteOrderText, rapidMode: isRapidAnalysis }),
-        signal: controller.signal
+      setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+      localStorage.setItem('iazap_ai_logs', JSON.stringify([newLog, ...aiLogs].slice(0, 50)));
+
+      setAiDiagnostics(prev => ({
+        ...prev,
+        totalAnalises: prev.totalAnalises + 1,
+        resolvidaSemIa: prev.resolvidaSemIa + 1,
+        sucesso: prev.sucesso + 1
+      }));
+
+      const today = new Date();
+      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
+      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+
+      const totalVal = Number(localParsed.valorTotal) || 0;
+      let finalComis = Number(localParsed.comissaoSugerida) || 0;
+      if (finalComis === 0 && totalVal > 0) {
+        finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
+      }
+
+      setEditingPedido({
+        numeroVenda: nextNum,
+        data: formattedDate,
+        nomeCompleto: localParsed.nomeCompleto || '',
+        telefone1: localParsed.telefone1 || '',
+        telefone2: localParsed.telefone2 || '',
+        endereco: localParsed.endereco || '',
+        city: localParsed.city || 'NÃO INFORMADO',
+        state: localParsed.state || '',
+        produto: localParsed.produto || '',
+        cor: localParsed.cor || '',
+        quantidade: Number(localParsed.quantidade) || 1,
+        formaPagamento: localParsed.formaPagamento || '',
+        valorTotal: totalVal,
+        comissao: finalComis,
+        status: 'PENDING',
+        textoOriginal: pasteOrderText,
+        observacoes: localParsed.observacoes || 'Extraído via Modo Análise Rápida local',
+        supplier: currentSupplier
       });
 
-      clearTimeout(timeoutId);
+      triggerToast('success', 'Ficha processada em Modo Rápido com sucesso! (Sem uso de IA)');
+      setIsProcessingOrder(false);
+      return;
+    }
 
-      if (!response.ok) {
-        throw new Error(`Servidor retornou código ${response.status}`);
+    // Funções de validação solicitadas (Validação)
+    const isValidPhone = (str: string) => {
+      if (!str) return false;
+      const digitsOnly = str.replace(/\D/g, '');
+      return digitsOnly.length >= 8;
+    };
+
+    const isValidValue = (val: number) => {
+      return typeof val === 'number' && !isNaN(val) && val > 0;
+    };
+
+    const isValidCity = (str: string) => {
+      return str && str.trim().length > 0 && str !== 'NÃO INFORMADO';
+    };
+
+    const isValidProduct = (str: string) => {
+      return str && str.trim().length > 0 && str !== 'Produto não identificado';
+    };
+
+    // Validar regras requisitadas
+    const isPhoneValid = isValidPhone(localParsed.telefone1);
+    const isValueValid = isValidValue(localParsed.valorTotal);
+    const isCityValid = isValidCity(localParsed.city);
+    const isProductValid = isValidProduct(localParsed.produto);
+
+    // Calcular correspondência de campos preenchidos p/ avaliar >= 80% do preenchimento
+    let foundFieldsCount = 0;
+    if (localParsed.nomeCompleto && localParsed.nomeCompleto.trim().length > 2) foundFieldsCount++;
+    if (isPhoneValid) foundFieldsCount++;
+    if (isCityValid) foundFieldsCount++;
+    if (isProductValid) foundFieldsCount++;
+    if (isValueValid) foundFieldsCount++;
+    if (localParsed.endereco && localParsed.endereco.trim().length > 3 || localParsed.city === 'RETIRADA') foundFieldsCount++;
+    if (localParsed.formaPagamento && localParsed.formaPagamento !== 'A combinar' && localParsed.formaPagamento !== 'NÃO INFORMADO') foundFieldsCount++;
+    if (localParsed.comissaoSugerida > 0 || (localParsed.valorTotal > 0 && comissaoPercent > 0)) foundFieldsCount++;
+
+    // REGRA DE CONFIANÇA: Se o parser preencher mais de 80% dos campos fundamentais E passar nas validações cruciais:
+    // Não chamar Gemini. Salvar resultado.
+    const isHighConfidence = foundFieldsCount >= 6 && isPhoneValid && isValueValid && isCityValid && isProductValid;
+
+    if (isHighConfidence) {
+      const durationMs = Date.now() - analysisStartTime;
+      
+      // Registrar log com indicação conceitual de parser local
+      const newLog: AiAnalysisLog = {
+        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
+        timestamp: new Date().toISOString(),
+        durationMs,
+        textLength: textLen,
+        inputText: pasteOrderText,
+        response: JSON.stringify(localParsed, null, 2),
+        isRapid: true,
+        supplier: currentSupplier,
+        modelUsed: `PARSER LOCAL (${localParsed.modelUsed || "Sem IA"})`,
+        errorCode: "SUCCESS"
+      };
+
+      setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+
+      // Incrementar os diagnósticos de consumo local sem custos de créditos de IA
+      setAiDiagnostics(prev => ({
+        ...prev,
+        totalAnalises: prev.totalAnalises + 1,
+        resolvidaSemIa: prev.resolvidaSemIa + 1,
+        sucesso: prev.sucesso + 1
+      }));
+
+      // Preencher o formulário
+      const today = new Date();
+      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
+      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+
+      const totalVal = Number(localParsed.valorTotal) || 0;
+      let finalComis = Number(localParsed.comissaoSugerida) || 0;
+      if (finalComis === 0 && totalVal > 0) {
+        finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
       }
 
-      const resJson = await response.json();
-      if (resJson.success && resJson.data) {
-        const extracted = resJson.data;
-        const durationMs = Date.now() - analysisStartTime;
+      setEditingPedido({
+        numeroVenda: nextNum,
+        data: formattedDate,
+        nomeCompleto: localParsed.nomeCompleto || '',
+        telefone1: localParsed.telefone1 || '',
+        telefone2: localParsed.telefone2 || '',
+        endereco: localParsed.endereco || '',
+        city: localParsed.city || 'NÃO INFORMADO',
+        state: localParsed.state || '',
+        produto: localParsed.produto || '',
+        cor: localParsed.cor || '',
+        quantidade: Number(localParsed.quantidade) || 1,
+        formaPagamento: localParsed.formaPagamento || '',
+        valorTotal: totalVal,
+        comissao: finalComis,
+        status: 'PENDING',
+        textoOriginal: pasteOrderText,
+        observacoes: localParsed.observacoes || 'Extraído via Parser Local Inteligente',
+        supplier: currentSupplier
+      });
 
-        // Save successful log
-        const newLog: AiAnalysisLog = {
-          id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
-          timestamp: new Date().toISOString(),
-          durationMs,
-          textLength: textLen,
-          inputText: pasteOrderText,
-          response: JSON.stringify(extracted, null, 2),
-          isRapid: isRapidAnalysis
-        };
-        setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+      triggerToast('success', 'Ficha processada localmente com sucesso! (Economizado crédito de IA)');
+      setIsProcessingOrder(false);
+      return;
+    }
 
-        // Generate pre-filled structure
-        const today = new Date();
-        const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-        const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+    // ETAPA 2 - GEMINI (Somente se o parser local falhar em encontrar pelo menos 80% do pedido de forma válida)
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    const maxRetries = 3;
+    const retryDelays = [2000, 5500, 10000]; // Tentativa automática (espera 2s, depois 5.5s, depois 10s se necessário)
 
-        // Opcionalmente sugerir valor de comissão (10% se não especificado)
-        const totalVal = Number(extracted.valorTotal) || 0;
-        let finalComis = Number(extracted.comissaoSugerida) || 0;
-        if (finalComis === 0 && totalVal > 0) {
-          finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
+    let attempt = 0;
+    let lastError: any = null;
+    let isSuccessful = false;
+    let extracted: any = null;
+    let errorCodeValue = "";
+
+    // ETAPA 3 - SEGUNDA TENTATIVA E MODALIDADE DE RETRY EM ERROS DA API (500, 503, Timeout, etc.)
+    for (attempt = 0; attempt <= maxRetries; attempt++) {
+      const attemptLabel = `Tentativa ${attempt + 1}/${maxRetries + 1}`;
+      console.log(`[Diagnostic] Modelo: gemini-3.5-flash | Duração: ${Date.now() - analysisStartTime}ms | ${attemptLabel}`);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+      }, 30000); // 30s timeout
+
+      try {
+        const response = await fetch("/api/gemini/parse-pedido", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: pasteOrderText, rapidMode: isRapidAnalysis }),
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          throw new Error(`Servidor retornou código ${response.status}`);
         }
 
-         setEditingPedido({
-           numeroVenda: nextNum,
-           data: formattedDate,
-           nomeCompleto: extracted.nomeCompleto || '',
-           telefone1: extracted.telefone1 || '',
-           telefone2: extracted.telefone2 || '',
-           endereco: extracted.endereco || '',
-           city: extracted.city || '',
-           state: extracted.state || '',
-           produto: extracted.produto || '',
-           cor: extracted.cor || '',
-           quantidade: Number(extracted.quantidade) || 1,
-           formaPagamento: extracted.formaPagamento || '',
-           valorTotal: totalVal,
-           comissao: finalComis,
-           status: 'PENDING',
-           textoOriginal: pasteOrderText, // Armazena texto original completo com observações, CNPJ, etc.
-           observacoes: extracted.observacoes || '',
-           supplier: currentSupplier
-         });
-
-        triggerToast('success', 'Ficha interpretada pela IA com sucesso! Verifique os dados abaixo.');
-      } else {
-        throw new Error(resJson.error || "IA não conseguiu interpretar os campos estruturados.");
+        const resJson = await response.json();
+        if (resJson.success && resJson.data) {
+          extracted = resJson.data;
+          isSuccessful = true;
+          errorCodeValue = "SUCCESS";
+          break;
+        } else {
+          throw new Error(resJson.error || "IA não conseguiu interpretar os campos estruturados.");
+        }
+      } catch (error: any) {
+        clearTimeout(timeoutId);
+        lastError = error;
+        const isTimeout = error.name === 'AbortError';
+        errorCodeValue = isTimeout ? 'TIMEOUT_30S' : (error.message || '500_OR_503_ERROR');
+        
+        console.error(`[Diagnostic Error] ${attemptLabel} falhou com código ${errorCodeValue}.`);
+        
+        if (attempt < maxRetries) {
+          const waitTime = retryDelays[attempt];
+          console.log(`Aguardando retry em ${waitTime}ms...`);
+          await delay(waitTime);
+        }
       }
-    } catch (error: any) {
-      clearTimeout(timeoutId);
-      const durationMs = Date.now() - analysisStartTime;
-      const isTimeout = error.name === 'AbortError';
-      const errorMsg = isTimeout ? 'Análise cancelada devido ao tempo limite de 15 segundos excedido do Gemini.' : (error.message || 'Não foi possível interpretar o pedido.');
-      
-      console.error("Erro na análise da IA:", error);
-      
-      // Save error log
+    }
+
+    const durationMs = Date.now() - analysisStartTime;
+
+    if (isSuccessful && extracted) {
+      // Registrar log bem sucedido
+      const newLog: AiAnalysisLog = {
+        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
+        timestamp: new Date().toISOString(),
+        durationMs,
+        textLength: textLen,
+        inputText: pasteOrderText,
+        response: JSON.stringify(extracted, null, 2),
+        isRapid: isRapidAnalysis,
+        supplier: currentSupplier,
+        modelUsed: "gemini-3.5-flash",
+        errorCode: "SUCCESS"
+      };
+      setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+
+      // Atualizar Controle de Consumo
+      setAiDiagnostics(prev => ({
+        ...prev,
+        totalAnalises: prev.totalAnalises + 1,
+        enviadaGemini: prev.enviadaGemini + 1,
+        sucesso: prev.sucesso + 1
+      }));
+
+      // Preencher dados estruturados
+      const today = new Date();
+      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
+      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+
+      const totalVal = Number(extracted.valorTotal) || 0;
+      let finalComis = Number(extracted.comissaoSugerida) || 0;
+      if (finalComis === 0 && totalVal > 0) {
+        finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
+      }
+
+      setEditingPedido({
+        numeroVenda: nextNum,
+        data: formattedDate,
+        nomeCompleto: extracted.nomeCompleto || '',
+        telefone1: extracted.telefone1 || '',
+        telefone2: extracted.telefone2 || '',
+        endereco: extracted.endereco || '',
+        city: extracted.city || 'NÃO INFORMADO',
+        state: extracted.state || '',
+        produto: extracted.produto || '',
+        cor: extracted.cor || '',
+        quantidade: Number(extracted.quantidade) || 1,
+        formaPagamento: extracted.formaPagamento || '',
+        valorTotal: totalVal,
+        comissao: finalComis,
+        status: 'PENDING',
+        textoOriginal: pasteOrderText,
+        observacoes: extracted.observacoes || '',
+        supplier: currentSupplier
+      });
+
+      triggerToast('success', 'Ficha interpretada pela IA com sucesso! Verifique os dados abaixo.');
+    } else {
+      // ETAPA 4 - FALLBACK (Análise pelo parser local de emergência, aberto em cadastro manual)
+      const errorMsg = lastError?.name === 'AbortError' 
+        ? 'Análise cancelada devido ao tempo limite de 30 segundos excedido do Gemini.' 
+        : (lastError?.message || 'IA temporariamente indisponível.');
+
       const newLog: AiAnalysisLog = {
         id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
         timestamp: new Date().toISOString(),
@@ -734,16 +1502,51 @@ export default function App() {
         textLength: textLen,
         inputText: pasteOrderText,
         error: errorMsg,
-        isRapid: isRapidAnalysis
+        isRapid: isRapidAnalysis,
+        supplier: currentSupplier,
+        modelUsed: "gemini-3.5-flash",
+        errorCode: errorCodeValue
       };
       setAiLogs(prev => [newLog, ...prev].slice(0, 50));
 
-      // Set explicit error text for display as requested
-      setAiAnalysisError("A IA não conseguiu interpretar a ficha.");
-      triggerToast('error', 'A IA não conseguiu interpretar a ficha.');
-    } finally {
-      setIsProcessingOrder(false);
+      // Atualizar estatísticas de consumo com indicação de erro na IA
+      setAiDiagnostics(prev => ({
+        ...prev,
+        totalAnalises: prev.totalAnalises + 1,
+        enviadaGemini: prev.enviadaGemini + 1,
+        erros: prev.erros + 1
+      }));
+
+      const today = new Date();
+      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
+      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+
+      setEditingPedido({
+        numeroVenda: nextNum,
+        data: formattedDate,
+        nomeCompleto: localParsed.nomeCompleto || '',
+        telefone1: localParsed.telefone1 || '',
+        telefone2: localParsed.telefone2 || '',
+        endereco: localParsed.endereco || '',
+        city: localParsed.city || 'NÃO INFORMADO',
+        state: localParsed.state || '',
+        produto: localParsed.produto || 'Produto não identificado',
+        cor: localParsed.cor || '',
+        quantidade: Number(localParsed.quantidade) || 1,
+        formaPagamento: localParsed.formaPagamento || 'PIX',
+        valorTotal: localParsed.valorTotal || 0,
+        comissao: localParsed.comissaoSugerida || 0,
+        status: 'PENDING',
+        textoOriginal: pasteOrderText, // Nunca esvazia e nunca perde o texto original
+        observacoes: localParsed.observacoes || 'Extraído via Fallback de Emergência',
+        supplier: currentSupplier
+      });
+
+      setAiAnalysisError("IA temporariamente indisponível. Você pode continuar utilizando o cadastro manual.");
+      triggerToast('info', 'Ficha preenchida via Fallback de Emergência (cadastro manual aberto).');
     }
+
+    setIsProcessingOrder(false);
   };
 
   // 6. CAMPO “PEDIDO ENTREGUE” COM IA
@@ -857,6 +1660,9 @@ export default function App() {
 
       await savePedido(payload);
       
+      // Memorize patterns found in the successfully saved order
+      registerNewPatterns(payload);
+      
       triggerToast('success', `Pedido ${payload.numeroVenda} de ${payload.nomeCompleto} salvo com sucesso!`);
       
       // Clean form states
@@ -925,40 +1731,24 @@ export default function App() {
     const todayStr = `${dd}/${mm}`;
 
     return currentSupplierPedidos.map(p => {
-      if (p.status !== 'RESCHEDULED' && p.status !== 'PENDING') return null;
+      // HOJE DELIVERY NOTIFICATIONS PANEL must show ONLY:
+      // - status === 'RESCHEDULED'
+      // - rescheduled date is today
+      // Never show PENDING, DELIVERED, CANCELLED, or DELIVERED_UNPAID.
+      if (p.status !== 'RESCHEDULED') return null;
 
-      const targetDate = p.dataReagendamento ? p.dataReagendamento : p.data;
+      const targetDate = p.dataReagendamento || p.rescheduleDate;
       if (!targetDate) return null;
 
       const cleanTarget = targetDate.trim().replace(/\s/g, '');
       const cleanToday = todayStr;
 
       if (cleanTarget === cleanToday) {
-        let label = '';
-        let type: 'delivery' | 'scheduled' | 'rescheduled' = 'delivery';
-        let icon = '📦';
-        let colorClass = 'border-l-blue-500 bg-blue-50/40';
-        let priority: 'high' | 'medium' | 'low' = 'low';
-
-        if (p.dataReagendamento) {
-          type = 'rescheduled';
-          label = `⏰ Pedido reagendado vence hoje:\n${p.nomeCompleto}`;
-          icon = '⏰';
-          colorClass = 'border-l-rose-500 bg-rose-50/20';
-          priority = 'high';
-        } else if (p.status === 'RESCHEDULED') {
-          type = 'scheduled';
-          label = `🚚 Pedido agendado para hoje:\n${p.nomeCompleto} - ${p.produto}`;
-          icon = '🚚';
-          colorClass = 'border-l-amber-500 bg-amber-50/20';
-          priority = 'medium';
-        } else {
-          type = 'delivery';
-          label = `📦 Hoje é a data de entrega:\n${p.nomeCompleto} - ${p.produto}`;
-          icon = '📦';
-          colorClass = 'border-l-emerald-500 bg-emerald-50/10';
-          priority = 'low';
-        }
+        let label = `⏰ Pedido agendado vence hoje:\n${p.nomeCompleto}`;
+        let type: 'delivery' | 'scheduled' | 'rescheduled' = 'rescheduled';
+        let icon = '⏰';
+        let colorClass = 'border-l-rose-500 bg-rose-50/20';
+        let priority: 'high' | 'medium' | 'low' = 'high';
 
         return {
           pedido: p,
@@ -1119,6 +1909,61 @@ export default function App() {
         const readableError = parseFirebaseError(err);
         triggerToast('error', `Falha ao cancelar o pedido: ${readableError}`);
       }
+    }
+  };
+
+  // Exclude Order definitely with backup
+  const handleExcludePedido = async (pedido: Pedido) => {
+    console.log("[DEBUG handleExcludePedido] Evento disparado para o pedido:", pedido);
+    
+    if (!pedido || !pedido.id) {
+      console.error("[DEBUG handleExcludePedido] Erro: O pedido selecionado não possui ID válido!");
+      triggerToast('error', 'Falha ao identificar a venda: ID ausente.');
+      return;
+    }
+
+    if (!isAdminMode) {
+      console.warn("[DEBUG handleExcludePedido] Permissão negada: Modo Admin inativo.");
+      triggerToast('error', 'Apenas administradores podem excluir vendas.');
+      return;
+    }
+
+    const confirmDelete = window.confirm(`Tem certeza que deseja excluir a venda #${pedido.numeroVenda || pedido.id} definitivamente?`);
+    if (!confirmDelete) {
+      console.log("[DEBUG handleExcludePedido] Exclusão cancelada na confirmação.");
+      return;
+    }
+
+    try {
+      const deletedByUser = currentUser?.email || currentUser?.displayName || 'Administrador (Dashboard)';
+      console.log("[DEBUG handleExcludePedido] Iniciando exclusão definitiva. Usuário:", deletedByUser);
+
+      // Chamando a exclusão com backup
+      await excludeOrderWithBackup(pedido, deletedByUser);
+      
+      // Atualizando o estado local imediatamente após a exclusão de forma otimista
+      console.log("[DEBUG handleExcludePedido] Removendo o pedido do estado local imediatamente.");
+      setPedidos(curr => curr.filter(p => p.id !== pedido.id));
+
+      triggerToast('success', 'Venda excluída definitivamente e salva no histórico de exclusões.');
+    } catch (error: any) {
+      console.error("[DEBUG handleExcludePedido] Erro crítico ao excluir venda:", error);
+      triggerToast('error', `Falha ao excluir venda: ${error.message || error}`);
+    }
+  };
+
+  // Restore excluded order
+  const handleRestoreExcludedOrder = async (backup: ExcludedOrderBackup) => {
+    if (!isAdminMode) {
+      triggerToast('error', 'Apenas administradores podem restaurar vendas excluídas.');
+      return;
+    }
+    try {
+      await restoreExcludedOrderToSystem(backup);
+      triggerToast('success', 'Venda restaurada com sucesso!');
+    } catch (error: any) {
+      console.error("Error restoring order: ", error);
+      triggerToast('error', `Falha ao restaurar venda: ${error.message || error}`);
     }
   };
 
@@ -1301,8 +2146,9 @@ export default function App() {
 
   // Helper: Validate status filter matching criteria
   const matchStatus = (p: Pedido) => {
+    if (!tabFilterState(p)) return false;
     if (selectedStatuses.includes('Todos')) {
-      return tabFilterState(p);
+      return true;
     }
     return selectedStatuses.some(selected => {
       if (selected === 'Pendentes') return p.status === 'PENDING';
@@ -1789,72 +2635,94 @@ export default function App() {
                   )}
                 </AnimatePresence>
               </div>
- 
+
               <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
                 {/* ⚡ ANÁLISE RÁPIDA TOGGLE */}
-                <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-700 bg-slate-100 hover:bg-slate-250 py-1.5 px-3 rounded-full transition font-extrabold shadow-3xs">
-                  <input
-                    type="checkbox"
-                    checked={isRapidAnalysis}
-                    onChange={(e) => setIsRapidAnalysis(e.target.checked)}
-                    className="rounded text-rose-500 focus:ring-rose-500 w-3.5 h-3.5 accent-rose-500 cursor-pointer"
-                  />
-                  <span>⚡ Análise Rápida</span>
-                </label>
+                <div className="flex flex-col gap-1">
+                  <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-700 bg-slate-100 hover:bg-slate-200 py-1.5 px-3 rounded-full transition font-extrabold shadow-3xs border border-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={isRapidAnalysis}
+                      onChange={(e) => {
+                        const val = e.target.checked;
+                        setIsRapidAnalysis(val);
+                        localStorage.setItem('iazap_is_rapid', val ? 'true' : 'false');
+                      }}
+                      className="rounded text-rose-500 focus:ring-rose-500 w-3.5 h-3.5 accent-rose-500 cursor-pointer"
+                    />
+                    <span>⚡ Análise Rápida</span>
+                  </label>
+                  <div className="text-[10px] pl-1 font-bold">
+                    {isRapidAnalysis ? (
+                      <span className="text-emerald-700">Modo rápido ativo - sem uso de IA</span>
+                    ) : (
+                      <span className="text-blue-600">Modo IA ativo</span>
+                    )}
+                  </div>
+                </div>
 
                 <div className="flex items-center gap-2 flex-grow sm:flex-none justify-end">
                   <button
                     id="btn-create-manual-fallback"
-                  onClick={() => {
-                    const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
-                    setEditingPedido({
-                      numeroVenda: nextNum,
-                      data: new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }),
-                      nomeCompleto: '',
-                      telefone1: '',
-                      telefone2: '',
-                      endereco: '',
-                      city: '',
-                      state: '',
-                      produto: '',
-                      cor: '',
-                      quantidade: 1,
-                      formaPagamento: 'PIX',
-                      valorTotal: 0,
-                      comissao: 0,
-                      status: 'PENDING',
-                      textoOriginal: 'Ficha Cadastrada Manualmente',
-                      observacoes: '',
-                      supplier: currentSupplier
-                    });
-                  }}
-                  className="bg-white border border-slate-200 hover:border-slate-300 text-slate-700 hover:bg-slate-50 text-xs py-2.5 px-4.5 rounded-full font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5 text-slate-500" />
-                  Cadastrar Sem IA
-                </button>
- 
-                <button
-                  id="btn-analisar-pedido-ia"
-                  onClick={handleParseWhatsAppOrder}
-                  disabled={isProcessingOrder}
-                  className="flex-grow sm:flex-none bg-brand hover:bg-brand-hover text-white disabled:bg-slate-100 disabled:text-slate-400 text-xs py-2.5 px-5 rounded-full font-bold transition flex items-center justify-center gap-2 shadow-xs cursor-pointer"
-                >
-                  {isProcessingOrder ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                      Analisando ficha...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-4 h-4 text-blue-200" />
-                      Analisar e Preencher dados
-                    </>
-                  )}
-                </button>
+                    onClick={() => {
+                      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+                      setEditingPedido({
+                        numeroVenda: nextNum,
+                        data: new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }),
+                        nomeCompleto: '',
+                        telefone1: '',
+                        telefone2: '',
+                        endereco: '',
+                        city: '',
+                        state: '',
+                        produto: '',
+                        cor: '',
+                        quantidade: 1,
+                        formaPagamento: 'PIX',
+                        valorTotal: 0,
+                        comissao: 0,
+                        status: 'PENDING',
+                        textoOriginal: 'Ficha Cadastrada Manualmente',
+                        observacoes: '',
+                        supplier: currentSupplier
+                      });
+                    }}
+                    className="bg-white border border-slate-200 hover:border-slate-300 text-slate-700 hover:bg-slate-50 text-xs py-2.5 px-4.5 rounded-full font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-slate-500" />
+                    Cadastrar Sem IA
+                  </button>
+  
+                  <button
+                    id="btn-analisar-pedido-ia"
+                    onClick={handleParseWhatsAppOrder}
+                    disabled={isProcessingOrder}
+                    className="flex-grow sm:flex-none bg-brand hover:bg-brand-hover text-white disabled:bg-slate-100 disabled:text-slate-400 text-xs py-2.5 px-5 rounded-full font-bold transition flex items-center justify-center gap-2 shadow-xs cursor-pointer"
+                  >
+                    {isProcessingOrder ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        Analisando ficha...
+                      </>
+                    ) : (
+                      <>
+                        {isRapidAnalysis ? (
+                          <>
+                            <Zap className="w-4 h-4 text-amber-200" />
+                            <span>Analisar de Forma Rápida</span>
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="w-4 h-4 text-blue-200" />
+                            <span>Analisar e Preencher Dados</span>
+                          </>
+                        )}
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
  
             {/* PANEL 2: MARCAR ENTREGUE COM IA */}
             <div className="bg-white rounded-3xl p-6 shadow-sm border border-slate-200/90 flex flex-col justify-between h-full hover:shadow-xs transition duration-300">
@@ -2881,7 +3749,7 @@ export default function App() {
         // RENDER VIEWMODE 2: ADMINISTRATIVE SPREADSHEET SCREEN
         <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-4">
           
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-slate-200/60 pb-3">
             <div>
               <h2 className="font-sans font-extrabold text-xl text-slate-900 flex items-center gap-2">
                 <Grid className="w-5 h-5 text-brand" />
@@ -2890,7 +3758,25 @@ export default function App() {
               <p className="text-xs text-slate-500">Tudo conectado ao Firebase em tempo real. Pressione Tab de célula em célula para preencher rapidamente.</p>
             </div>
             
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Admin Mode Toggle */}
+              <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-700 bg-slate-100 hover:bg-slate-200 py-1.5 px-3.5 rounded-full transition font-extrabold shadow-3xs border border-slate-200 mr-1.5">
+                <input
+                  type="checkbox"
+                  checked={isAdminMode}
+                  onChange={(e) => {
+                    const checkedVal = e.target.checked;
+                    setIsAdminMode(checkedVal);
+                    if (!checkedVal) {
+                      setActiveSpreadsheetTab('ativos');
+                    }
+                  }}
+                  className="rounded text-brand focus:ring-brand w-3.5 h-3.5 accent-brand cursor-pointer"
+                />
+                <Shield className="w-3.5 h-3.5 text-slate-500" />
+                <span>Modo Admin ({isAdminMode ? "Ativo" : "Inativo"})</span>
+              </label>
+
               <button
                 onClick={handleAddNewManualRowSpreadsheet}
                 className="bg-brand hover:bg-brand-hover text-white text-xs py-2.5 px-5 rounded-full font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
@@ -2907,188 +3793,308 @@ export default function App() {
               </button>
             </div>
           </div>
- 
-          <div className="bg-white rounded-3xl shadow-sm border border-slate-200/90 overflow-hidden">
-            <div className="overflow-x-auto">
-              
-              <table className="w-full text-xs text-left border-collapse min-w-[900px]">
-                
-                <thead>
-                  <tr className="bg-slate-50 text-slate-500 text-[10px] uppercase font-extrabold tracking-wider border-b border-slate-200/90">
-                    <th className="px-3 py-3.5 w-28">Nº Venda</th>
-                    <th className="px-3 py-3.5 w-24">Data</th>
-                    <th className="px-3 py-3.5 w-56">Cliente</th>
-                    <th className="px-3 py-3.5 w-64">Produto</th>
-                    <th className="px-3 py-3.5 w-36">Cor</th>
-                    <th className="px-3 py-3.5 w-32 text-right">Valor Célula (R$)</th>
-                    <th className="px-3 py-3.5 w-32 text-right">Comissão (R$)</th>
-                    <th className="px-3 py-3.5 w-36 text-center">Status</th>
-                    <th className="px-3 py-3.5 w-20 text-center text-rose-650">Cancelar</th>
-                  </tr>
-                </thead>
 
-                <tbody className="divide-y divide-natural-border/50 font-mono">
-                  {currentSupplierPedidos.length > 0 ? (
-                    currentSupplierPedidos.map((p) => (
-                      <tr key={p.id} className="hover:bg-slate-50/50 transition">
-                        
-                        {/* Numero */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="text"
-                            value={p.numeroVenda}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'numeroVenda', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, numeroVenda: v } : item));
-                            }}
-                            className="w-full font-bold text-natural-text bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none"
-                          />
-                        </td>
-
-                        {/* Data */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="text"
-                            value={p.data}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'data', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, data: v } : item));
-                            }}
-                            className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none text-natural-muted"
-                          />
-                        </td>
-
-                        {/* Cliente */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="text"
-                            value={p.nomeCompleto}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'nomeCompleto', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, nomeCompleto: v } : item));
-                            }}
-                            className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none font-sans text-natural-text"
-                          />
-                        </td>
-
-                        {/* Produto */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="text"
-                            value={p.produto}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'produto', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, produto: v } : item));
-                            }}
-                            className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none font-sans text-natural-text font-medium"
-                          />
-                        </td>
-
-                        {/* Cor */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="text"
-                            value={p.cor || ''}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'cor', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, cor: v } : item));
-                            }}
-                            placeholder="Preto..."
-                            className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none font-sans text-natural-muted"
-                          />
-                        </td>
-
-                        {/* Valor Total */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="number"
-                            value={p.valorTotal}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'valorTotal', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, valorTotal: parseFloat(v) || 0 } : item));
-                            }}
-                            className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none text-right font-bold text-natural-text"
-                          />
-                        </td>
-
-                        {/* Comissão */}
-                        <td className="px-2 py-2">
-                          <input 
-                            type="number"
-                            value={p.comissao}
-                            onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'comissao', e.target.value)}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, comissao: parseFloat(v) || 0 } : item));
-                            }}
-                            className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none text-right font-bold text-brand"
-                          />
-                        </td>
-
-                        {/* Status selector */}
-                        <td className="px-2 py-2">
-                          <select
-                            value={p.status}
-                            onChange={async (e) => {
-                              const nextStat = e.target.value as any;
-                              if (nextStat === 'RESCHEDULED') {
-                                handleQuickStatusUpdate(p.id, 'RESCHEDULED');
-                              } else {
-                                await updatePedidoStatus(p.id, nextStat);
-                                const readable = nextStat === 'PENDING' ? 'Pendente' :
-                                                 nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
-                                                 nextStat === 'CANCELLED' ? 'Cancelado' : 'Entregue';
-                                triggerToast('success', `Status alterado na planilha: ${readable}`);
-                              }
-                            }}
-                            className={`w-full text-center p-1 rounded border border-natural-border-dark outline-none font-semibold ${
-                              p.status === 'PENDING' ? 'bg-amber-50 text-amber-700' :
-                              p.status === 'RESCHEDULED' ? 'bg-orange-50/75 text-orange-950' :
-                              p.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-700' :
-                              p.status === 'CANCELLED' ? 'bg-red-50 text-rose-800' :
-                              'bg-emerald-50 text-emerald-700'
-                            }`}
-                          >
-                            <option value="PENDING">Pendente</option>
-                            <option value="RESCHEDULED">Reagendado / Agendado</option>
-                            <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
-                            <option value="DELIVERED">Entregue</option>
-                            <option value="CANCELLED">❌ Cancelado</option>
-                          </select>
-                        </td>
-
-                        {/* Cancelar */}
-                        <td className="px-2 py-2 text-center">
-                          <button 
-                            onClick={() => handleCancelPedido(p.id)}
-                            className="p-1 hover:bg-rose-50 text-rose-500 rounded transition cursor-pointer"
-                            title="Cancelar Pedido"
-                          >
-                            <XCircle className="w-3.5 h-3.5" />
-                          </button>
-                        </td>
-
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={9} className="py-12 text-center text-slate-400">
-                        Nenhuma venda cadastrada.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-
-              </table>
-
+          {/* Subtabs to view Standard Spreadsheet vs Excluded Sales list */}
+          {isAdminMode && (
+            <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-2xl w-fit border border-slate-200">
+              <button
+                onClick={() => setActiveSpreadsheetTab('ativos')}
+                className={`text-xs font-extrabold py-1.5 px-4.5 rounded-xl transition cursor-pointer ${
+                  activeSpreadsheetTab === 'ativos'
+                    ? 'bg-white text-slate-900 shadow-3xs border border-slate-200/55'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                Planilha Geral
+              </button>
+              <button
+                onClick={() => setActiveSpreadsheetTab('excluidos')}
+                className={`text-xs font-extrabold py-1.5 px-4.5 rounded-xl transition flex items-center gap-1.5 cursor-pointer ${
+                  activeSpreadsheetTab === 'excluidos'
+                    ? 'bg-rose-500 text-white shadow-3xs'
+                    : 'text-rose-600 hover:text-rose-700 hover:bg-rose-50/50'
+                }`}
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Vendas Excluídas ({excludedOrders.length})
+              </button>
             </div>
-          </div>
+          )}
+
+          {activeSpreadsheetTab === 'excluidos' && isAdminMode ? (
+            /* RENDER AUDIT LOG OF EXCLUDED SALES */
+            <div className="bg-white rounded-3xl shadow-sm border border-slate-200/90 overflow-hidden animate-fadeIn">
+              <div className="p-5 border-b border-slate-200 bg-slate-50/50">
+                <h3 className="font-sans font-extrabold text-sm text-rose-700 flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-rose-500" />
+                  Histórico de Exclusões Definitivas (Auditoria de Segurança)
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                  As vendas listadas abaixo foram excluídas da Planilha Geral e de todos os relatórios/estatísticas. Somente administradores têm acesso a este log de segurança e podem restaurar os registros originais para o sistema a qualquer momento.
+                </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left border-collapse min-w-[900px]">
+                  <thead>
+                    <tr className="bg-slate-50 text-slate-500 text-[10px] uppercase font-extrabold tracking-wider border-b border-slate-200/90">
+                      <th className="px-4 py-3.5 w-32">Data Exclusão</th>
+                      <th className="px-4 py-3.5 w-24">Hora</th>
+                      <th className="px-4 py-3.5 w-48">Usuário</th>
+                      <th className="px-4 py-3.5 w-32">Fornecedor</th>
+                      <th className="px-4 py-3.5 w-28">Nº Venda</th>
+                      <th className="px-4 py-3.5">Cliente & Pedido Original</th>
+                      <th className="px-4 py-3.5 w-32 text-right">Valor Original</th>
+                      <th className="px-4 py-3.5 w-28 text-center text-emerald-650">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-mono">
+                    {excludedOrders.length > 0 ? (
+                      excludedOrders.map((backup) => {
+                        const original = backup.pedidoCompleto || {};
+                        return (
+                          <tr key={backup.id} className="hover:bg-rose-50/20 transition">
+                            <td className="px-4 py-3 text-slate-900 font-bold">{backup.deletedAtDate}</td>
+                            <td className="px-4 py-3 text-slate-500">{backup.deletedAtTime}</td>
+                            <td className="px-4 py-3 text-slate-700 font-sans font-bold text-[11px]">
+                              {backup.deletedBy}
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className="text-[10px] uppercase font-extrabold bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full border border-blue-100 font-sans">
+                                {backup.supplier}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-slate-900 font-bold">#{original.numeroVenda || 'N/A'}</td>
+                            <td className="px-4 py-3 font-sans">
+                              <div>
+                                <span className="font-bold text-slate-900 text-xs">{original.nomeCompleto || 'Sem Nome'}</span>
+                                <span className="text-slate-400 text-[10px] ml-2">({original.city || 'Sem Cidade'} - {original.state || 'UF'})</span>
+                              </div>
+                              <div className="text-[10px] text-slate-500 mt-0.5 font-mono">
+                                {original.produto || 'N/A'} {original.cor ? `| Cor: ${original.cor}` : ''} ({original.quantidade || 1} un)
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 text-right font-bold text-slate-900">
+                              R$ {(original.valorTotal || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <button
+                                onClick={() => handleRestoreExcludedOrder(backup)}
+                                className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-extrabold px-3 py-1 rounded-full transition cursor-pointer flex items-center gap-1 mx-auto shadow-3xs"
+                                title="Restaurar Pedido para a Planilha Geral"
+                              >
+                                <RefreshCw className="w-3 h-3" />
+                                Restaurar
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    ) : (
+                      <tr>
+                        <td colSpan={8} className="py-16 text-center text-slate-400 font-sans">
+                          A lixeira administrativa está vazia. Nenhuma venda foi excluída recentemente.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : (
+            /* STANDARD VIEW FOR SPREADSHEET */
+            <div className="bg-white rounded-3xl shadow-sm border border-slate-200/90 overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left border-collapse min-w-[900px]">
+                  <thead>
+                    <tr className="bg-slate-50 text-slate-500 text-[10px] uppercase font-extrabold tracking-wider border-b border-slate-200/90">
+                      <th className="px-3 py-3.5 w-28">Nº Venda</th>
+                      <th className="px-3 py-3.5 w-24">Data</th>
+                      <th className="px-3 py-3.5 w-48">Cliente</th>
+                      <th className="px-3 py-3.5 w-56">Produto</th>
+                      <th className="px-3 py-3.5 w-32">Cor</th>
+                      <th className="px-3 py-3.5 w-28 text-right">Valor Venda (R$)</th>
+                      <th className="px-3 py-3.5 w-28 text-right">Comissão (R$)</th>
+                      <th className="px-3 py-3.5 w-32 text-center">Status</th>
+                      <th className="px-3 py-3.5 w-16 text-center text-rose-650">Cancelar</th>
+                      {isAdminMode && <th className="px-3 py-3.5 w-16 text-center text-red-650">Excluir</th>}
+                    </tr>
+                  </thead>
+
+                  <tbody className="divide-y divide-natural-border/50 font-mono">
+                    {currentSupplierPedidos.length > 0 ? (
+                      currentSupplierPedidos.map((p) => (
+                        <tr key={p.id} className="hover:bg-slate-50/50 transition">
+                          {/* Numero */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="text"
+                              value={p.numeroVenda}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'numeroVenda', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, numeroVenda: v } : item));
+                              }}
+                              className="w-full font-bold text-natural-text bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none"
+                            />
+                          </td>
+
+                          {/* Data */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="text"
+                              value={p.data}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'data', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, data: v } : item));
+                              }}
+                              className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none text-natural-muted"
+                            />
+                          </td>
+
+                          {/* Cliente */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="text"
+                              value={p.nomeCompleto}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'nomeCompleto', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, nomeCompleto: v } : item));
+                              }}
+                              className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none font-sans text-natural-text"
+                            />
+                          </td>
+
+                          {/* Produto */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="text"
+                              value={p.produto}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'produto', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, produto: v } : item));
+                              }}
+                              className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none font-sans text-natural-text font-medium"
+                            />
+                          </td>
+
+                          {/* Cor */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="text"
+                              value={p.cor || ''}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'cor', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, cor: v } : item));
+                              }}
+                              placeholder="Preto..."
+                              className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none font-sans text-natural-muted"
+                            />
+                          </td>
+
+                          {/* Valor Total */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="number"
+                              value={p.valorTotal}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'valorTotal', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, valorTotal: parseFloat(v) || 0 } : item));
+                              }}
+                              className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none text-right font-bold text-natural-text"
+                            />
+                          </td>
+
+                          {/* Comissão */}
+                          <td className="px-2 py-2">
+                            <input 
+                              type="number"
+                              value={p.comissao}
+                              onBlur={(e) => handleSpreadsheetCellBlur(p.id, 'comissao', e.target.value)}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPedidos(curr => curr.map(item => item.id === p.id ? { ...item, comissao: parseFloat(v) || 0 } : item));
+                              }}
+                              className="w-full bg-transparent hover:bg-brand-light focus:bg-white p-1 rounded border border-transparent focus:border-brand outline-none text-right font-bold text-brand"
+                            />
+                          </td>
+
+                          {/* Status selector */}
+                          <td className="px-2 py-2">
+                            <select
+                              value={p.status}
+                              onChange={async (e) => {
+                                const nextStat = e.target.value as any;
+                                if (nextStat === 'RESCHEDULED') {
+                                  handleQuickStatusUpdate(p.id, 'RESCHEDULED');
+                                } else {
+                                  await updatePedidoStatus(p.id, nextStat);
+                                  const readable = nextStat === 'PENDING' ? 'Pendente' :
+                                                   nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
+                                                   nextStat === 'CANCELLED' ? 'Cancelado' : 'Entregue';
+                                  triggerToast('success', `Status alterado na planilha: ${readable}`);
+                                }
+                              }}
+                              className={`w-full text-center p-1 rounded border border-natural-border-dark outline-none font-semibold ${
+                                p.status === 'PENDING' ? 'bg-amber-50 text-amber-700' :
+                                p.status === 'RESCHEDULED' ? 'bg-orange-50/75 text-orange-950' :
+                                p.status === 'DELIVERED_UNPAID' ? 'bg-blue-50 text-blue-700' :
+                                p.status === 'CANCELLED' ? 'bg-red-50 text-rose-800' :
+                                'bg-emerald-50 text-emerald-700'
+                              }`}
+                            >
+                              <option value="PENDING">Pendente</option>
+                              <option value="RESCHEDULED">Reagendado / Agendado</option>
+                              <option value="DELIVERED_UNPAID">Entregue e Não Pago</option>
+                              <option value="DELIVERED">Entregue</option>
+                              <option value="CANCELLED">❌ Cancelado</option>
+                            </select>
+                          </td>
+
+                          {/* Cancelar */}
+                          <td className="px-2 py-2 text-center">
+                            <button 
+                              onClick={() => handleCancelPedido(p.id)}
+                              className="p-1 hover:bg-rose-50 text-rose-500 rounded transition cursor-pointer"
+                              title="Cancelar Pedido"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+
+                          {/* Excluir */}
+                          {isAdminMode && (
+                            <td className="px-2 py-2 text-center">
+                              <button 
+                                onClick={() => handleExcludePedido(p)}
+                                className="p-1 hover:bg-red-50 text-red-500 rounded transition cursor-pointer"
+                                title="Excluir Venda Definitivamente (Backup na Lixeira Admin)"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </td>
+                          )}
+
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan={isAdminMode ? 10 : 9} className="py-12 text-center text-slate-400">
+                          Nenhuma venda cadastrada.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+
+                </table>
+
+              </div>
+            </div>
+          )}
 
         </main>
       )}
@@ -4028,48 +5034,105 @@ export default function App() {
 
                   {activeSettingsTab === 'ailogs' && (
                     <div className="space-y-4 text-left">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
                         <div>
-                          <h4 className="text-xs font-bold text-slate-900">Logs & Diagnósticos de Inteligência Artificial</h4>
-                          <p className="text-[10px] text-slate-500 font-medium">Monitore o desempenho, tempos de resposta e falhas da IA.</p>
+                          <h4 className="text-xs font-bold text-slate-900">Logs & Diagnósticos de Consumo e Inteligência</h4>
+                          <p className="text-[10px] text-slate-500 font-medium">Monitore a economia de créditos, o parser local híbrido e o histórico de análises.</p>
                         </div>
-                        <button
-                          onClick={() => {
-                            setAiLogs([]);
-                            triggerToast('info', 'Histórico de logs de IA limpo.');
-                          }}
-                          className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-[9.5px] py-1 px-2.5 rounded-lg transition cursor-pointer"
-                        >
-                          Limpar Logs
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => {
+                              setAiDiagnostics({
+                                totalAnalises: 0,
+                                resolvidaSemIa: 0,
+                                enviadaGemini: 0,
+                                sucesso: 0,
+                                erros: 0
+                              });
+                              triggerToast('success', 'Estatísticas de consumo de IA resetadas.');
+                            }}
+                            className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-extrabold text-[9.5px] py-1 px-2.5 rounded-lg transition cursor-pointer border border-indigo-100"
+                          >
+                            Zerar Telemetria
+                          </button>
+                          <button
+                            onClick={() => {
+                              setAiLogs([]);
+                              triggerToast('info', 'Histórico de logs de IA limpo.');
+                            }}
+                            className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-[9.5px] py-1 px-2.5 rounded-lg transition cursor-pointer"
+                          >
+                            Limpar Histórico
+                          </button>
+                        </div>
                       </div>
-
-                      {/* STATS GAUGE */}
-                      <div className="grid grid-cols-3 gap-3">
-                        <div className="bg-slate-50/65 p-3 rounded-2xl border border-slate-150">
-                          <span className="text-[8.5px] font-mono uppercase text-slate-450 block tracking-wider font-extrabold">Total Acumulado</span>
-                          <span className="text-sm font-black text-slate-800 mt-1 block">{aiLogs.length}</span>
+ 
+                      {/* STATS GAUGE - PAINEL DE DIAGNÓSTICO DO CONTROLE DE CONSUMO DE IA */}
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <div className="bg-white p-3 rounded-2xl border border-slate-200 text-center shadow-xs">
+                          <span className="text-[8.5px] font-mono uppercase text-slate-400 block tracking-wider font-extrabold">Total Análises</span>
+                          <span className="text-sm font-black text-slate-800 mt-1 block">{aiDiagnostics.totalAnalises}</span>
                         </div>
-                        <div className="bg-slate-50/65 p-3 rounded-2xl border border-slate-150">
-                          <span className="text-[8.5px] font-mono uppercase text-slate-450 block tracking-wider font-extrabold">Tempo Médio (s)</span>
-                          <span className="text-sm font-black text-slate-800 mt-1 block">
-                            {aiLogs.length > 0 
-                              ? `${(aiLogs.reduce((acc, curr) => acc + curr.durationMs, 0) / aiLogs.length / 1000).toFixed(2)}s` 
-                              : '0.00s'}
-                          </span>
+                        <div className="bg-emerald-50 p-3 rounded-2xl border border-emerald-100 text-center shadow-xs">
+                          <span className="text-[8.5px] font-mono uppercase text-emerald-600 block tracking-wider font-extrabold">Resolvidas Sem IA</span>
+                          <span className="text-sm font-black text-emerald-800 mt-1 block">⚡ {aiDiagnostics.resolvidaSemIa}</span>
                         </div>
-                        <div className="bg-slate-50/65 p-3 rounded-2xl border border-slate-150">
-                          <span className="text-[8.5px] font-mono uppercase text-slate-450 block tracking-wider font-extrabold">Sucesso</span>
+                        <div className="bg-indigo-50 p-3 rounded-2xl border border-indigo-100 text-center shadow-xs">
+                          <span className="text-[8.5px] font-mono uppercase text-indigo-600 block tracking-wider font-extrabold font-black">Enviadas p/ IA</span>
+                          <span className="text-sm font-black text-indigo-800 mt-1 block">🤖 {aiDiagnostics.enviadaGemini}</span>
+                        </div>
+                        <div className="bg-white p-3 rounded-2xl border border-slate-200 text-center shadow-xs">
+                          <span className="text-[8.5px] font-mono uppercase text-slate-400 block tracking-wider font-extrabold">Taxa de Sucesso</span>
                           <span className="text-sm font-black text-slate-800 mt-1 block">
-                            {aiLogs.length > 0 
-                              ? `${((aiLogs.filter(l => !l.error).length / aiLogs.length) * 100).toFixed(0)}%` 
+                            {aiDiagnostics.totalAnalises > 0 
+                              ? `${((aiDiagnostics.sucesso / aiDiagnostics.totalAnalises) * 100).toFixed(0)}%` 
                               : '100%'}
                           </span>
                         </div>
+                        <div className="col-span-2 md:col-span-1 bg-amber-50 p-3 rounded-2xl border border-amber-100 text-center shadow-xs">
+                          <span className="text-[8.5px] font-mono uppercase text-amber-700 block tracking-wider font-bold">Economia Estimada</span>
+                          <span className="text-xs font-black text-amber-800 mt-1.5 block">
+                            R$ {(aiDiagnostics.resolvidaSemIa * 0.15).toFixed(2)}
+                          </span>
+                        </div>
                       </div>
 
+                      {/* MEMÓRIA DE PADRÕES APRENDIDAS */}
+                      <div className="bg-slate-100/70 border border-slate-200 rounded-3xl p-4.5 space-y-3 shadow-2xs">
+                        <div className="flex items-center gap-2">
+                          <Sparkles className="w-4 h-4 text-rose-500 animate-pulse" />
+                          <div>
+                            <h5 className="text-[10px] uppercase font-black tracking-wider text-slate-800">Aprendizado Interno (Memória de Padrões)</h5>
+                            <p className="text-[9.5px] text-slate-500 font-medium">Bancos de dados de correspondência local e caches em tempo real acelerados por economia ativa.</p>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-slate-200/60 pt-3">
+                          <div className="space-y-1.5">
+                            <span className="text-[9px] font-mono font-extrabold text-blue-700 block uppercase tracking-wider">Cidades Registradas ({learnedPatterns.cities.length}):</span>
+                            <div className="flex flex-wrap gap-1 max-h-[75px] overflow-y-auto no-scrollbar p-1">
+                              {learnedPatterns.cities.map((city: string, idx: number) => (
+                                <span key={`${city}-${idx}`} className="text-[8px] px-2 py-0.5 bg-blue-50 text-blue-700 border border-blue-100 rounded-full font-mono font-semibold">
+                                  📍 {city}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="space-y-1.5">
+                            <span className="text-[9px] font-mono font-extrabold text-emerald-700 block uppercase tracking-wider">Produtos Repetidos ({learnedPatterns.products.length}):</span>
+                            <div className="flex flex-wrap gap-1 max-h-[75px] overflow-y-auto no-scrollbar p-1">
+                              {learnedPatterns.products.map((prod: string, idx: number) => (
+                                <span key={`${prod}-${idx}`} className="text-[8px] px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-100 rounded-full font-mono font-semibold">
+                                  📦 {prod}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+ 
                       {/* EXPANDABLE LOGS LIST */}
-                      <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1 no-scrollbar">
+                      <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1 no-scrollbar border-t border-slate-100 pt-3">
+                        <h5 className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mb-1">Últimas 50 Análises e Rastreamentos:</h5>
                         {aiLogs.length > 0 ? (
                           aiLogs.map((log) => (
                             <div key={log.id} className="bg-white border border-slate-200 rounded-2xl p-3.5 space-y-2.5 hover:shadow-2xs transition">
@@ -4079,30 +5142,49 @@ export default function App() {
                                     {new Date(log.timestamp).toLocaleTimeString('pt-BR')} ({new Date(log.timestamp).toLocaleDateString('pt-BR')})
                                   </span>
                                   <span className={`text-[8.5px] px-1.5 py-0.2 rounded-full font-bold uppercase ${
-                                    log.isRapid 
-                                      ? 'bg-rose-50 text-rose-600 border border-rose-100' 
-                                      : 'bg-blue-50 text-blue-600 border border-blue-100'
+                                    log.modelUsed?.includes('LOCAL')
+                                      ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                                      : log.isRapid 
+                                        ? 'bg-rose-50 text-rose-600 border border-rose-100' 
+                                        : 'bg-blue-50 text-blue-600 border border-blue-100'
                                   }`}>
-                                    {log.isRapid ? '⚡ Rápido' : '🔍 Completo'}
+                                    {log.modelUsed?.includes('LOCAL') ? '⚡ LOCAL (GRAÇA)' : log.isRapid ? '⚡ Rápido' : '🔍 Completo'}
                                   </span>
+                                  {log.supplier && (
+                                    <span className="text-[8.5px] px-1.5 py-0.2 bg-slate-100 text-slate-650 border border-slate-200 rounded-full font-mono font-bold uppercase">
+                                      {log.supplier}
+                                    </span>
+                                  )}
+                                  {log.modelUsed && (
+                                    <span className="text-[8.5px] px-1.5 py-0.2 bg-indigo-50 text-indigo-750 border border-indigo-100 rounded-full font-mono font-bold">
+                                      🤖 {log.modelUsed}
+                                    </span>
+                                  )}
                                 </div>
-
+ 
                                 <div className="flex items-center gap-2">
                                   <span className="text-[9.5px] font-mono font-bold text-slate-650 bg-slate-100 px-1.5 py-0.5 rounded">
                                     {(log.durationMs / 1000).toFixed(2)}s
                                   </span>
+                                  {log.errorCode && (
+                                    <span className={`text-[8.5px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                                      log.errorCode === 'SUCCESS' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-700'
+                                    }`}>
+                                      {log.errorCode}
+                                    </span>
+                                  )}
                                   <span className="text-[9px] font-mono text-slate-400">
                                     {log.textLength} chars
                                   </span>
                                   <span className={`w-2 h-2 rounded-full ${log.error ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'}`} />
                                 </div>
                               </div>
-
+ 
                               <div className="text-[10px] space-y-1 bg-slate-50 p-2.5 rounded-xl border border-slate-150 font-mono text-slate-700 whitespace-pre-wrap max-h-24 overflow-y-auto no-scrollbar scroll-smooth">
                                 <div className="text-[8.5px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-200 pb-1 mb-1">Texto Enviado do WhatsApp:</div>
                                 {log.inputText}
                               </div>
-
+ 
                               {log.error ? (
                                 <div className="text-[10px] p-2.5 bg-rose-50/60 border border-rose-150 rounded-xl text-rose-800 font-mono">
                                   <div className="text-[8.5px] font-black text-rose-500 uppercase tracking-widest pb-0.5">Erro Retornado:</div>
@@ -4110,7 +5192,7 @@ export default function App() {
                                 </div>
                               ) : log.response ? (
                                 <div className="text-[10px] p-2.5 bg-emerald-50/40 border border-emerald-150 rounded-xl text-slate-800 font-mono max-h-32 overflow-y-auto no-scrollbar">
-                                  <div className="text-[8.5px] font-black text-emerald-600 uppercase tracking-widest border-b border-emerald-100 pb-1 mb-1">Campos Interpretados da IA:</div>
+                                  <div className="text-[8.5px] font-black text-emerald-600 uppercase tracking-widest border-b border-emerald-100 pb-1 mb-1">Campos Interpretados:</div>
                                   {log.response}
                                 </div>
                               ) : null}
