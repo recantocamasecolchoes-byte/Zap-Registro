@@ -13,7 +13,93 @@ import {
   where
 } from 'firebase/firestore';
 import { db, auth, isFirebaseConfigured, handleFirestoreError, OperationType } from './firebase';
-import { Pedido } from './types';
+import { Pedido, CustomUser } from './types';
+import bcrypt from 'bcryptjs';
+
+// LocalStorage storage and sync for Custom Users
+let currentOfflineUsers: CustomUser[] = [];
+export const DEFAULT_SYSTEM_USERS: CustomUser[] = [
+  {
+    id: "user-alan",
+    username: "alan",
+    password: "", // Seeded below
+    name: "Alan",
+    role: "admin",
+    active: true
+  },
+  {
+    id: "user-esposa",
+    username: "esposa",
+    password: "", // Seeded below
+    name: "Esposa",
+    role: "admin",
+    active: true
+  }
+];
+
+// Seed bcrypt hashes for the default passwords (alan123 and esposa123)
+const SALT_ROUNDS = 10;
+const hashedAlan = bcrypt.hashSync("alan123", SALT_ROUNDS);
+const hashedEsposa = bcrypt.hashSync("esposa123", SALT_ROUNDS);
+DEFAULT_SYSTEM_USERS[0].password = hashedAlan;
+DEFAULT_SYSTEM_USERS[1].password = hashedEsposa;
+
+function getLocalStorageUsers(): CustomUser[] {
+  const data = localStorage.getItem("iazap_users");
+  if (!data) {
+    localStorage.setItem("iazap_users", JSON.stringify(DEFAULT_SYSTEM_USERS));
+    currentOfflineUsers = [...DEFAULT_SYSTEM_USERS];
+    return currentOfflineUsers;
+  }
+  try {
+    currentOfflineUsers = JSON.parse(data);
+    return currentOfflineUsers;
+  } catch (e) {
+    return DEFAULT_SYSTEM_USERS;
+  }
+}
+
+function setLocalStorageUsers(users: CustomUser[]) {
+  currentOfflineUsers = [...users];
+  localStorage.setItem("iazap_users", JSON.stringify(users));
+  window.dispatchEvent(new Event("iazap_users_update"));
+}
+
+const usersLocalListeners: Set<(users: CustomUser[]) => void> = new Set();
+if (typeof window !== "undefined") {
+  window.addEventListener("iazap_users_update", () => {
+    const fresh = getLocalStorageUsers();
+    usersLocalListeners.forEach(listener => listener(fresh));
+  });
+}
+
+/**
+ * Seemless automatic seeder for admin users on startup
+ */
+export async function seedInitialUsersIfEmpty(): Promise<void> {
+  if (isFirebaseConfigured && db) {
+    try {
+      const q = query(collection(db, "users"));
+      const snapshot = await getDocs(q);
+      if (snapshot.empty) {
+        console.log("Seeding initial administrator users...");
+        for (const user of DEFAULT_SYSTEM_USERS) {
+          const docId = user.id || `user-${user.username}`;
+          const { id, ...payload } = user;
+          await setDoc(doc(db, "users", docId), {
+            ...payload,
+            createdAt: serverTimestamp()
+          });
+        }
+        console.log("Seeding complete.");
+      }
+    } catch (err) {
+      console.error("Erro ao semear usuários iniciais no Firestore:", err);
+    }
+  } else {
+    getLocalStorageUsers();
+  }
+}
 
 // Mock values used when local storage is empty
 const INITIAL_MOCK_PEDIDOS: Pedido[] = [
@@ -204,7 +290,7 @@ export function subscribePedidos(
 /**
  * Saves a new Pedido or overwrites an existing one
  */
-export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): Promise<string> {
+export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, byUser?: string): Promise<string> {
   const rawStatus = (pedido.status || 'PENDING') as any;
   const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
     (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
@@ -315,6 +401,13 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): 
     updatedAt: isFirebaseConfigured ? serverTimestamp() : Date.now()
   };
 
+  if (byUser) {
+    if (!pedido.id) {
+      payload.createdBy = byUser;
+    }
+    payload.updatedBy = byUser;
+  }
+
   if (isFirebaseConfigured && db) {
     if (auth?.currentUser) {
       payload.userId = auth.currentUser.uid;
@@ -364,7 +457,8 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }): 
 export async function updatePedidoStatus(
   id: string, 
   newStatus: any,
-  extra?: { dataReagendamento?: string }
+  extra?: { dataReagendamento?: string },
+  byUser?: string
 ): Promise<void> {
   // 1. ADICIONAR LOGS COMPLETOS
   console.log("Atualizando pedido...");
@@ -404,6 +498,9 @@ export async function updatePedidoStatus(
     status: fileStatus,
     updatedAt: isFirebaseConfigured ? serverTimestamp() : Date.now()
   };
+  if (byUser) {
+    updatePayload.updatedBy = byUser;
+  }
   if (extra && extra.dataReagendamento !== undefined) {
     updatePayload.dataReagendamento = extra.dataReagendamento;
     updatePayload.rescheduleDate = extra.dataReagendamento;
@@ -428,6 +525,9 @@ export async function updatePedidoStatus(
       list[idx].status = fileStatus;
       if (extra && extra.dataReagendamento !== undefined) {
         list[idx].dataReagendamento = extra.dataReagendamento;
+      }
+      if (byUser) {
+        list[idx].updatedBy = byUser;
       }
       list[idx].updatedAt = Date.now();
       setLocalStoragePedidos(list);
@@ -866,6 +966,120 @@ export async function restoreExcludedOrderToSystem(
     const list = getLocalStorageExclusions();
     const filtered = list.filter(b => b.id !== backup.id);
     setLocalStorageExclusions(filtered);
+  }
+}
+
+/**
+ * Subscribes to real-time custom users
+ */
+export function subscribeUsers(
+  onUpdate: (users: CustomUser[]) => void,
+  onError: (error: any) => void
+): () => void {
+  if (isFirebaseConfigured && db) {
+    const q = query(collection(db, "users"));
+    return onSnapshot(q, (snapshot) => {
+      const list: CustomUser[] = [];
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        list.push({
+          id: docSnap.id,
+          username: d.username || '',
+          password: d.password || '',
+          name: d.name || '',
+          role: d.role || 'user',
+          active: d.active !== false,
+        });
+      });
+      onUpdate(list);
+    }, (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, "users");
+      } catch (formattedError: any) {
+        onError(formattedError);
+      }
+    });
+  } else {
+    // LocalStorage Mode
+    const list = getLocalStorageUsers();
+    onUpdate(list);
+    
+    const localCallback = (freshList: CustomUser[]) => {
+      onUpdate(freshList);
+    };
+    usersLocalListeners.add(localCallback);
+    
+    return () => {
+      usersLocalListeners.delete(localCallback);
+    };
+  }
+}
+
+/**
+ * Saves or updates a custom user in users collection
+ */
+export async function saveCustomUser(user: CustomUser): Promise<string> {
+  const payload: any = {
+    username: user.username.trim().toLowerCase(),
+    name: user.name.trim(),
+    role: user.role || 'user',
+    active: user.active !== false,
+  };
+
+  if (user.password && user.password.trim() !== '') {
+    if (!user.password.startsWith('$2a$') && !user.password.startsWith('$2b$')) {
+      const salt = bcrypt.genSaltSync(10);
+      payload.password = bcrypt.hashSync(user.password.trim(), salt);
+    } else {
+      payload.password = user.password;
+    }
+  } else if (user.id) {
+    // If updating but password is empty, don't overwrite password
+    // (the caller should retrieve existing password hash first)
+  }
+
+  if (isFirebaseConfigured && db) {
+    try {
+      const userId = user.id || `user-${payload.username}`;
+      const docRef = doc(db, "users", userId);
+      await setDoc(docRef, payload, { merge: true });
+      return userId;
+    } catch (err: any) {
+      handleFirestoreError(err, user.id ? OperationType.UPDATE : OperationType.CREATE, `users/${user.id || 'new'}`);
+    }
+  } else {
+    const list = getLocalStorageUsers();
+    let finalId = user.id || `user-${payload.username}`;
+    const existingIdx = list.findIndex(u => u.id === finalId || u.username === payload.username);
+    if (existingIdx !== -1) {
+      // Merge password if omitted
+      if (!payload.password && list[existingIdx].password) {
+        payload.password = list[existingIdx].password;
+      }
+      list[existingIdx] = { ...list[existingIdx], ...payload, id: finalId };
+    } else {
+      list.push({ ...payload, id: finalId });
+    }
+    setLocalStorageUsers(list);
+    return finalId;
+  }
+}
+
+/**
+ * Deletes a custom user
+ */
+export async function deleteCustomUser(id: string): Promise<void> {
+  if (isFirebaseConfigured && db) {
+    try {
+      const docRef = doc(db, "users", id);
+      await deleteDoc(docRef);
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.DELETE, `users/${id}`);
+    }
+  } else {
+    const list = getLocalStorageUsers();
+    const filtered = list.filter(u => u.id !== id);
+    setLocalStorageUsers(filtered);
   }
 }
 

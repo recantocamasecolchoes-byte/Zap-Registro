@@ -21,8 +21,20 @@ export interface Pedido {
   state?: string;
   supplier?: 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS';
   userId?: string;
+  createdBy?: string;
+  updatedBy?: string;
   createdAt?: string | number | Date | any;
   updatedAt?: string | number | Date | any;
+}
+
+export interface CustomUser {
+  id?: string;
+  username: string;
+  password?: string;
+  name: string;
+  role: 'admin' | 'user';
+  active: boolean;
+  createdAt?: any;
 }
 
 export interface AiAnalysisLog {

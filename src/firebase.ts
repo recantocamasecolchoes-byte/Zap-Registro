@@ -1,5 +1,4 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup, signInAnonymously, signOut, onAuthStateChanged, User } from 'firebase/auth';
 import { 
   getFirestore, 
   collection, 
@@ -26,21 +25,18 @@ export const isFirebaseConfigured =
 
 let app: any;
 let db: any;
-let auth: any;
-let googleProvider: any;
+const auth: any = null;
 
 if (isFirebaseConfigured) {
   try {
     app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
     db = getFirestore(app, firebaseConfig.firestoreDatabaseId || undefined);
-    auth = getAuth(app);
-    googleProvider = new GoogleAuthProvider();
   } catch (err) {
     console.warn("Erro ao inicializar Firebase. Entrando em modo offline (LocalStorage):", err);
   }
 }
 
-export { app, db, auth, googleProvider };
+export { app, db, auth };
 
 // 19. TRATAMENTO DE ERROS - Formatar erros de forma clara e legível
 export enum OperationType {

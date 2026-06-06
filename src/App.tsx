@@ -43,10 +43,18 @@ import {
   Upload,
   Shield,
   FileSpreadsheet,
-  Zap
+  Zap,
+  Users,
+  EyeOff,
+  Lock,
+  UserPlus,
+  UserCheck,
+  UserX,
+  Key
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Pedido, AiAnalysisLog, ExcludedOrderBackup } from './types';
+import { Pedido, AiAnalysisLog, ExcludedOrderBackup, CustomUser } from './types';
+import bcrypt from 'bcryptjs';
 import { 
   subscribePedidos, 
   savePedido, 
@@ -61,28 +69,68 @@ import {
   BackupItem,
   subscribeExcludedOrders,
   excludeOrderWithBackup,
-  restoreExcludedOrderToSystem
+  restoreExcludedOrderToSystem,
+  DEFAULT_SYSTEM_USERS,
+  seedInitialUsersIfEmpty,
+  subscribeUsers,
+  saveCustomUser,
+  deleteCustomUser
 } from './dbService';
 import * as XLSX from 'xlsx';
 import { 
   auth, 
-  googleProvider, 
   isFirebaseConfigured,
   parseFirebaseError
 } from './firebase';
 import { 
-  signInWithPopup, 
   signInAnonymously, 
-  signOut, 
-  onAuthStateChanged 
+  signOut
 } from 'firebase/auth';
 
 export default function App() {
   // Database state
   const [pedidos, setPedidos] = useState<Pedido[]>([]);
-  const [authReady, setAuthReady] = useState(false);
-  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [authReady, setAuthReady] = useState(true);
+  
+  // Operator name from local localStorage configuration
+  const [operatorName, setOperatorNameState] = useState<string>(() => {
+    const saved = localStorage.getItem("operatorName");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object' && parsed.operatorName) {
+          return parsed.operatorName;
+        }
+        if (typeof parsed === 'string') return parsed;
+      } catch (e) {
+        // Fallback below
+      }
+      return saved;
+    }
+    // Fallback default operator
+    localStorage.setItem("operatorName", JSON.stringify({ operatorName: "Alan" }));
+    return "Alan";
+  });
+
+  const handleSaveOperatorName = (name: string) => {
+    setOperatorNameState(name);
+    localStorage.setItem("operatorName", JSON.stringify({ operatorName: name }));
+  };
+
+  // Derive currentUser to preserve deep backwards-compatibility silently
+  const currentUser = {
+    uid: "vendedor",
+    username: operatorName.trim().toLowerCase().replace(/\s+/g, ''),
+    name: operatorName.trim(),
+    displayName: operatorName.trim(),
+    role: "admin",
+    active: true,
+    photoURL: null,
+    email: `${operatorName.trim().toLowerCase().replace(/\s+/g, '')}@crm`
+  };
+
   const [isFirebaseSyncActive, setIsFirebaseSyncActive] = useState(isFirebaseConfigured);
+  const [isAuthConnecting, setIsAuthConnecting] = useState(false);
 
   // Sync state
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -114,7 +162,7 @@ export default function App() {
   const [isRestoring, setIsRestoring] = useState<boolean>(false);
   const [isExecutingUpdate, setIsExecutingUpdate] = useState<boolean>(false);
   const [updateStep, setUpdateStep] = useState<number>(0); 
-  const [activeSettingsTab, setActiveSettingsTab] = useState<'backup' | 'logs' | 'ailogs'>('backup');
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'backup' | 'logs' | 'ailogs' | 'diagnostico'>('backup');
 
   const handleCopyText = (text: string, fieldId: string) => {
     navigator.clipboard.writeText(text);
@@ -340,38 +388,45 @@ export default function App() {
     };
   }, []);
 
-  // Track Firebase connection
-  useEffect(() => {
-    if (isFirebaseConfigured && auth) {
-      const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
-        setCurrentUser(user);
-        setAuthReady(true);
-        if (user) {
-          triggerToast('success', `Conectado como ${user.displayName || user.email || 'Usuário Autenticado'}`);
-        } else {
-          try {
-            console.log("Iniciando login anônimo automático...");
-            await signInAnonymously(auth);
-          } catch (err: any) {
-            console.error("Falha no login anônimo automático:", err);
-            const readableError = parseFirebaseError(err);
-            triggerToast('error', `Falha ao conectar automaticamente: ${readableError}`);
-          }
-        }
-      });
-      return () => unsubscribeAuth();
-    } else {
-      setAuthReady(true);
-    }
-  }, []);
+  // Helper for Mobile Device Detection
+  const isMobileDevice = () => {
+    if (typeof window === 'undefined' || !window.navigator) return false;
+    const ua = navigator.userAgent;
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  };
 
-  // Sync / loading Database in Real-time
-  useEffect(() => {
-    if (isFirebaseConfigured && !currentUser) {
-      // Aguarda autenticação antes de se conectar ao Firestore
-      return;
+  // Helper for parsing Google Firebase Auth errors
+  const parseAuthError = (err: any): string => {
+    if (!err) return 'Erro desconhecido.';
+    const code = err.code || '';
+    const message = err.message || '';
+    
+    console.log("[AUTH DEBUG] Tratamento de erro detalhado. Cód:", code, "Msg:", message);
+    
+    if (code === 'auth/popup-blocked') {
+      return 'O popup do seu navegador foi bloqueado pelo celular ou navegador. Por favor, habilite popups ou utilize a reconexão por redirecionamento seguro automática.';
     }
+    if (code === 'auth/unauthorized-domain' || message.includes('unauthorized-domain')) {
+      return 'Este domínio não está cadastrado/autorizado no Console do seu Firebase Auth em "Authorized Domains".';
+    }
+    if (code === 'auth/network-request-failed' || code === 'auth/network-error' || message.includes('network-error')) {
+      return 'Erro de conexão com o servidor Google Auth. Verifique se o seu dispositivo está com internet ou dados móveis.';
+    }
+    if (code === 'auth/cancelled-popup-request') {
+      return 'Ação de popup de login sobreposta por outra requisição. Tente novamente.';
+    }
+    if (code === 'auth/popup-closed-by-user') {
+      return 'O login foi cancelado porque a janela do popup foi fechada antes de completar.';
+    }
+    if (code === 'auth/operation-not-allowed') {
+      return 'Autenticação por Google não está habilitada no Console do seu Firebase. Ative-a no painel Sign-in providers.';
+    }
+    
+    return message || code || 'Falha na autenticação rápida.';
+  };
 
+  // 1. Real-time Database synchronization on load
+  useEffect(() => {
     const unsubscribe = subscribePedidos(
       (updatedPedidos) => {
         setPedidos(updatedPedidos);
@@ -383,7 +438,7 @@ export default function App() {
       }
     );
     return () => unsubscribe();
-  }, [currentUser]);
+  }, []);
 
   // Toast dispatch helper
   const triggerToast = (type: 'success' | 'refused' | 'error' | 'info', message: string) => {
@@ -498,7 +553,7 @@ export default function App() {
       await saveBackupMetadata({
         createdAt: now.toISOString(),
         recordsCount: pedidos.length,
-        responsibleUser: currentUser?.email || 'Vendedor Autenticado',
+        responsibleUser: currentUser?.name || currentUser?.username || 'Vendedor Autenticado',
         fileSize: `${kbSize} KB`,
         backupType: 'manual',
         backupData: jsonStr
@@ -691,42 +746,10 @@ export default function App() {
   };
 
   // Auth Functions
-  const handleGoogleLogin = async () => {
-    if (!isFirebaseConfigured) {
-      triggerToast('info', 'Firebase não configurado. Ative no painel do AI Studio para habilitar login.');
-      return;
-    }
-    try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err: any) {
-      console.error(err);
-      triggerToast('error', `Falha ao entrar com Google: ${err.message || 'Erro Desconhecido'}`);
-    }
-  };
-
-  const handleAnonymousLogin = async () => {
-    if (!isFirebaseConfigured) {
-      triggerToast('info', 'Firebase não configurado. Usando armazenamento interno.');
-      return;
-    }
-    try {
-      await signInAnonymously(auth);
-      triggerToast('success', 'Entrou com sucesso de forma anônima!');
-    } catch (err: any) {
-      console.error(err);
-      triggerToast('error', `Falha ao entrar de forma anônima: ${err.message}`);
-    }
-  };
-
   const handleLogout = async () => {
-    if (!isFirebaseConfigured) return;
-    try {
-      await signOut(auth);
-      setCurrentUser(null);
-      triggerToast('info', 'Sessão encerrada.');
-    } catch (err: any) {
-      triggerToast('error', `Erro ao sair: ${err.message}`);
-    }
+    localStorage.removeItem("operatorName");
+    setOperatorNameState("Alan");
+    triggerToast('info', 'Operador reiniciado para o padrão.');
   };
 
   // 16. ATUALIZAÇÃO MANUAL
@@ -1593,7 +1616,7 @@ export default function App() {
         const index = pedidos.find(p => p.id === matchedId);
         
         if (index) {
-          await updatePedidoStatus(matchedId, 'DELIVERED');
+          await updatePedidoStatus(matchedId, 'DELIVERED', undefined, currentUser?.name || currentUser?.username || 'Sistema');
           triggerToast('success', `Confirmado! Pedido ${index.numeroVenda} (${index.nomeCompleto}) marcado como Entregue via IA.`);
           setPasteDeliveryText('');
         } else {
@@ -1658,7 +1681,7 @@ export default function App() {
         supplier: editingPedido.supplier || currentSupplier
       };
 
-      await savePedido(payload);
+      await savePedido(payload, currentUser?.name || currentUser?.username || 'Sistema');
       
       // Memorize patterns found in the successfully saved order
       registerNewPatterns(payload);
@@ -1696,7 +1719,7 @@ export default function App() {
         console.log("Novo status:", "RESCHEDULED");
         console.log("Nova data:", extra.dataReagendamento);
       }
-      await updatePedidoStatus(id, newStatus, extra);
+      await updatePedidoStatus(id, newStatus, extra, currentUser?.name || currentUser?.username || 'Sistema');
       if (newStatus === 'RESCHEDULED') {
         setCurrentTab('reagendados');
         setSelectedStatuses(['Todos']);
@@ -1900,7 +1923,7 @@ export default function App() {
   const handleCancelPedido = async (id: string) => {
     if (window.confirm("Tem certeza que deseja cancelar este pedido?")) {
       try {
-        await updatePedidoStatus(id, 'CANCELLED');
+        await updatePedidoStatus(id, 'CANCELLED', undefined, currentUser?.name || currentUser?.username || 'Sistema');
         triggerToast('success', 'Pedido cancelado com sucesso!');
         setSelectedPedido(null);
         setShowDropdownId(null);
@@ -1935,7 +1958,7 @@ export default function App() {
     }
 
     try {
-      const deletedByUser = currentUser?.email || currentUser?.displayName || 'Administrador (Dashboard)';
+      const deletedByUser = currentUser?.name || currentUser?.username || 'Administrador (Dashboard)';
       console.log("[DEBUG handleExcludePedido] Iniciando exclusão definitiva. Usuário:", deletedByUser);
 
       // Chamando a exclusão com backup
@@ -2232,7 +2255,7 @@ export default function App() {
     };
 
     try {
-      const newId = await savePedido(newObj);
+      const newId = await savePedido(newObj, currentUser?.name || currentUser?.username || 'Sistema');
       triggerToast('success', `Nova linha manual criada (${nextNum})!`);
     } catch (e: any) {
       console.error(e);
@@ -2262,7 +2285,7 @@ export default function App() {
 
     try {
       const updated = { ...target, [field]: castedVal };
-      await savePedido(updated);
+      await savePedido(updated, currentUser?.name || currentUser?.username || 'Sistema');
       triggerToast('success', `Célula sincronizada em tempo real!`);
     } catch (err: any) {
       console.error(err);
@@ -2270,6 +2293,29 @@ export default function App() {
       triggerToast('error', `Erro ao salvar edição: ${readableError}`);
     }
   };
+
+  if (!authReady || isAuthConnecting) {
+    return (
+      <div className="min-h-screen bg-[#0f172a] flex flex-col items-center justify-center p-6 text-white font-sans">
+        <div className="bg-[#1e293b] rounded-3xl p-8 max-w-sm w-full border border-slate-700/60 shadow-2xl flex flex-col items-center text-center space-y-6">
+          <div className="relative">
+            <div className="w-16 h-16 rounded-full border-4 border-slate-700 border-t-rose-500 animate-spin"></div>
+            <Zap className="absolute inset-0 m-auto w-6 h-6 text-rose-500 animate-pulse" />
+          </div>
+          <div>
+            <h1 className="text-xl font-extrabold tracking-tight">IA Zap Registro CRM</h1>
+            <p className="text-xs text-slate-400 mt-2 font-medium">
+              Conectando aos servidores seguros...
+            </p>
+          </div>
+          
+          <div className="text-[10px] text-slate-500 font-mono">
+            Sessão segura e redundante
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col antialiased font-sans">
@@ -2424,54 +2470,25 @@ export default function App() {
             </button>
  
             {/* Auth panel */}
-            {isFirebaseConfigured ? (
+            <div className="flex items-center gap-2">
               <div className="flex items-center gap-2">
-                {currentUser ? (
-                  <div className="flex items-center gap-2">
-                    <div className="hidden md:flex flex-col items-end text-right">
-                      <span className="text-xs text-slate-900 font-bold">{currentUser.displayName || 'Vendedor Autenticado'}</span>
-                      <span className="text-[10px] text-slate-500 font-medium">{currentUser.email || 'Conectado'}</span>
-                    </div>
-                    {currentUser.photoURL ? (
-                      <img src={currentUser.photoURL} alt="Foto usuário" referrerPolicy="no-referrer" className="w-7 h-7 rounded-full border border-slate-200 shadow-xs" />
-                    ) : (
-                      <div className="bg-slate-100 text-slate-700 w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs"><User className="w-4 h-4"/></div>
-                    )}
-                    <button 
-                      id="btn-logout"
-                      onClick={handleLogout}
-                      className="p-2 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-650 hover:border-red-200 rounded-xl text-slate-500 transition shadow-xs cursor-pointer"
-                      title="Sair da conta"
-                    >
-                      <LogOut className="w-4 h-4" />
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1">
-                    <button 
-                      id="btn-google-login"
-                      onClick={handleGoogleLogin}
-                      className="bg-brand text-white hover:bg-brand-hover text-xs py-2 px-3.5 rounded-xl font-bold flex items-center gap-1.5 transition shadow-xs hover:shadow-sm cursor-pointer"
-                    >
-                      Entrar c/ Google
-                    </button>
-                    <button 
-                      id="btn-anon-login"
-                      onClick={handleAnonymousLogin}
-                      className="bg-slate-100 text-slate-700 hover:bg-slate-200 text-xs py-2 px-3 rounded-xl font-bold transition cursor-pointer"
-                      title="Acessar sem Google"
-                    >
-                      Anônimo
-                    </button>
-                  </div>
-                )}
+                <div className="hidden md:flex flex-col items-end text-right">
+                  <span className="text-xs text-slate-900 font-bold">{currentUser.name || currentUser.displayName || 'Usuário'}</span>
+                  <span className="text-[10px] text-slate-500 font-medium font-mono uppercase">@{currentUser.username} • {currentUser.role === 'admin' ? 'Administrador' : 'Vendedor'}</span>
+                </div>
+                <div className="bg-slate-100 text-slate-705 w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm border border-slate-200" title={currentUser.role === 'admin' ? 'Acesso Administrativo' : 'Acesso Vendedor'}>
+                  {currentUser.role === 'admin' ? <ShieldCheck className="w-4.5 h-4.5 text-rose-650" /> : <User className="w-4.5 h-4.5 text-teal-650" />}
+                </div>
+                <button 
+                  id="btn-logout"
+                  onClick={handleLogout}
+                  className="p-2 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-700 hover:border-red-200 rounded-xl text-slate-500 transition shadow-xs cursor-pointer"
+                  title="Sair do CRM"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
               </div>
-            ) : (
-              <div className="hidden lg:flex items-center gap-1.5 text-xs text-slate-500 bg-slate-100 py-1.5 px-3 rounded-xl border border-slate-200 shadow-xs">
-                <Smartphone className="w-3.5 h-3.5" />
-                <span>Instalável como PWA</span>
-              </div>
-            )}
+            </div>
 
           </div>
 
@@ -4032,7 +4049,7 @@ export default function App() {
                                 if (nextStat === 'RESCHEDULED') {
                                   handleQuickStatusUpdate(p.id, 'RESCHEDULED');
                                 } else {
-                                  await updatePedidoStatus(p.id, nextStat);
+                                  await updatePedidoStatus(p.id, nextStat, undefined, currentUser?.name || currentUser?.username || 'Sistema');
                                   const readable = nextStat === 'PENDING' ? 'Pendente' :
                                                    nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
                                                    nextStat === 'CANCELLED' ? 'Cancelado' : 'Entregue';
@@ -4795,7 +4812,7 @@ export default function App() {
                     <ShieldCheck className="w-4 h-4" />
                     <span>Histórico & Auditoria ({backupsHistory.length})</span>
                   </button>
-                  <button
+                   <button
                     onClick={() => setActiveSettingsTab('ailogs')}
                     className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
                       activeSettingsTab === 'ailogs' 
@@ -4805,6 +4822,28 @@ export default function App() {
                   >
                     <Sparkles className="w-4 h-4" />
                     <span>Logs de IA ({aiLogs.length})</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveSettingsTab('diagnostico')}
+                    className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
+                      activeSettingsTab === 'diagnostico' 
+                        ? 'bg-rose-500 text-white shadow-sm' 
+                        : 'text-slate-600 hover:bg-slate-250 hover:text-slate-800'
+                    }`}
+                  >
+                    <Shield className="w-4 h-4 text-sky-500" />
+                    <span>Diagnóstico Firebase</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveSettingsTab('operator')}
+                    className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
+                      activeSettingsTab === 'operator' 
+                        ? 'bg-rose-500 text-white shadow-sm' 
+                        : 'text-slate-600 hover:bg-slate-250 hover:text-slate-800'
+                    }`}
+                  >
+                    <User className="w-4 h-4 text-rose-500" />
+                    <span>Configuração de Operador</span>
                   </button>
                 </div>
 
@@ -5204,6 +5243,169 @@ export default function App() {
                             <p className="text-[10.5px]">Nenhum evento registrado de análise de Inteligência Artificial.</p>
                           </div>
                         )}
+                      </div>
+                    </div>
+                  )}
+
+                  {activeSettingsTab === 'diagnostico' && (
+                    <div className="space-y-6 text-left animate-fade-in animate-duration-300">
+                      <div className="flex items-center gap-2">
+                        <Database className="w-5 h-5 text-indigo-500 animate-pulse" />
+                        <div>
+                          <h4 className="text-xs font-extrabold text-slate-900">Diagnóstico Firebase & CRM</h4>
+                          <p className="text-[10.5px] text-slate-500 font-medium font-sans">Informações de conexão técnica e autenticação em tempo real.</p>
+                        </div>
+                      </div>
+
+                      <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100 overflow-hidden text-xs shadow-xs">
+                        {/* 1. Firebase Configured & Connected */}
+                        <div className="p-4 flex items-center justify-between">
+                          <div>
+                            <p className="font-bold text-slate-800">Firebase Configurado</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium">Verificação de chaves de API no projeto</p>
+                          </div>
+                          <span className={`px-2.5 py-1 rounded-full text-[10px] font-extrabold ${isFirebaseConfigured ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' : 'bg-rose-50 text-rose-700 border border-rose-100'}`}>
+                            {isFirebaseConfigured ? 'SIM (Configurado)' : 'NÃO (Placeholder)'}
+                          </span>
+                        </div>
+
+                        {/* 2. Firestore Connected */}
+                        <div className="p-4 flex items-center justify-between">
+                          <div>
+                            <p className="font-bold text-slate-800">Firestore Conectado</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium">Sincronização bidirecional de pedidos em tempo real</p>
+                          </div>
+                          <span className={`px-2.5 py-1 rounded-full text-[10px] font-extrabold ${isFirebaseSyncActive && isFirebaseConfigured ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' : 'bg-rose-55 bg-rose-50 text-rose-700 border border-rose-150'}`}>
+                            {isFirebaseSyncActive && isFirebaseConfigured ? 'ATIVO' : 'DESACTIVADO'}
+                          </span>
+                        </div>
+
+                        {/* 3. Authentication Connected */}
+                        <div className="p-4 flex items-center justify-between">
+                          <div>
+                            <p className="font-bold text-slate-800">Authentication Conectado</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium font-sans">Estado do módulo de login</p>
+                          </div>
+                          <span className={`px-2.5 py-1 rounded-full text-[10px] font-extrabold ${authReady ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                            {authReady ? 'PRONTO (Sessões)' : 'CARREGANDO...'}
+                          </span>
+                        </div>
+
+                        {/* 4. Usuário autenticado */}
+                        <div className="p-4 flex items-center justify-between">
+                          <div>
+                            <p className="font-bold text-slate-800">Usuário Autenticado</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium font-sans">Conta conectada no dispositivo</p>
+                          </div>
+                          <span className={`px-2.5 py-1 rounded-full text-[10px] font-extrabold ${currentUser ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' : 'bg-slate-105 bg-slate-100 text-slate-650'}`}>
+                            {currentUser ? 'Operador Ativo' : 'Não Conectado'}
+                          </span>
+                        </div>
+
+                        {/* 5. UID do usuário */}
+                        <div className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-2 overflow-hidden">
+                          <div>
+                            <p className="font-bold text-slate-800 font-sans">UID do Usuário (Firebase UID)</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium">Identificador de segurança UUID</p>
+                          </div>
+                          <span className="font-mono bg-slate-50 border border-slate-200 rounded py-1 px-2.5 text-[10px] font-bold text-slate-700 select-all max-w-full overflow-x-auto">
+                            {currentUser ? currentUser.uid : 'Nenhum'}
+                          </span>
+                        </div>
+
+                        {/* 6. E-mail autenticado */}
+                        <div className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-2 overflow-hidden">
+                          <div>
+                            <p className="font-bold text-slate-800 font-sans">E-mail Autenticado</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium">Conta Google ativa</p>
+                          </div>
+                          <span className="font-mono bg-slate-50 border border-slate-200 rounded py-1 px-2.5 text-[10px] font-bold text-slate-700 select-all max-w-full overflow-x-auto font-sans">
+                            {currentUser && currentUser.email ? currentUser.email : 'Nenhum'}
+                          </span>
+                        </div>
+
+                        {/* 7. Dispositivo móvel */}
+                        <div className="p-4 flex items-center justify-between">
+                          <div>
+                            <p className="font-bold text-slate-800 font-sans">Dispositivo Detectado</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 font-medium font-sans">Método de autenticação utilizado</p>
+                          </div>
+                          <span className="bg-blue-50 text-blue-700 border border-blue-100 rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase font-sans">
+                            {isMobileDevice() ? 'MOBILE (Redirect Integrado PWA)' : 'DESKTOP (Popup & Fallbacks)'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="bg-slate-100/70 border border-slate-200 rounded-2xl p-4.5 space-y-2.5 shadow-2xs">
+                        <h5 className="text-[10px] font-bold text-slate-800 uppercase tracking-wider font-sans">Ações de Depuração e Renovação</h5>
+                        <p className="text-[10px] text-slate-500 leading-relaxed font-sans">
+                          Caso apresente travamentos de rede ou expiração do token de sessão de segurança do Google, utilize os controles abaixo para forçar restaurações de conexão rápidas.
+                        </p>
+                        <div className="flex gap-2 flex-wrap pt-1.5">
+                          <button
+                            onClick={async () => {
+                              try {
+                                triggerToast('info', 'Pingando servidor do Firestore...');
+                                const { doc, getDocFromServer } = await import('firebase/firestore');
+                                const { db } = await import('./firebase');
+                                await getDocFromServer(doc(db, 'test', 'connection'));
+                                triggerToast('success', 'Firestore respondendo normalmente em tempo real!');
+                              } catch (err: any) {
+                                triggerToast('error', `Falha ao conectar: ${err.message || err}`);
+                              }
+                            }}
+                            className="bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-300 text-slate-700 text-[10px] font-extrabold py-2 px-3.5 rounded-xl transition cursor-pointer shadow-2xs"
+                          >
+                            Pingar Firestore
+                          </button>
+                          
+                          <button
+                            onClick={async () => {
+                              try {
+                                if (auth && auth.currentUser) {
+                                  triggerToast('info', 'Forçando renovação segura de idToken...');
+                                  await auth.currentUser.getIdToken(true);
+                                  triggerToast('success', 'idToken Firebase renovado com sucesso absoluto!');
+                                } else {
+                                  triggerToast('error', 'Sem usuário ativo na conta para renovar token.');
+                                }
+                              } catch (err: any) {
+                                triggerToast('error', `Falha ao renovar idToken: ${err.message || err}`);
+                              }
+                            }}
+                            className="bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-300 text-slate-700 text-[10px] font-extrabold py-2 px-3.5 rounded-xl transition cursor-pointer shadow-2xs"
+                          >
+                            Renovar idToken
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeSettingsTab === 'operator' && (
+                    <div className="space-y-6 text-left animate-fade-in animate-duration-300 font-sans">
+                      <div className="flex items-center gap-2">
+                        <User className="w-5 h-5 text-rose-500" />
+                        <div>
+                          <h4 className="text-xs font-extrabold text-slate-900">Configuração de Operador Ativo</h4>
+                          <p className="text-[10.5px] text-slate-500 font-medium">Configure o nome de quem está operando o CRM. Esse nome será usado para registrar quem criou ou atualizou cada pedido.</p>
+                        </div>
+                      </div>
+
+                      <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-2xs space-y-4 max-w-md">
+                        <div className="space-y-2">
+                          <label className="text-[9.5px] font-bold text-slate-400 uppercase tracking-widest block animate-pulse">Nome do Operador Ativo</label>
+                          <input
+                            type="text"
+                            placeholder="Ex: Alan ou Esposa"
+                            value={operatorName}
+                            onChange={(e) => handleSaveOperatorName(e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 focus:border-rose-500 focus:outline-hidden py-2 px-3.5 rounded-xl text-xs text-slate-900 font-bold transition"
+                          />
+                        </div>
+                        <div className="text-[10px] text-slate-500 font-medium bg-slate-50 p-3.5 rounded-xl border border-slate-200/60 leading-relaxed font-sans">
+                          💡 O nome configurado acima é salvo localmente em seu navegador no <span className="font-mono">localStorage</span> e associado de maneira automática com as auditorias de criação (<span className="font-semibold">createdBy</span>) e edição (<span className="font-semibold">updatedBy</span>) de todos os pedidos no banco de dados Firestore.
+                        </div>
                       </div>
                     </div>
                   )}

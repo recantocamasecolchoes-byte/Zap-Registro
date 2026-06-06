@@ -133,6 +133,19 @@
         "backupType",
         "backupData"
       ]
+    },
+    "customUser": {
+      "title": "CustomUser",
+      "description": "Usuário customizado do sistema CRM",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string", "description": "Nome de login único do usuário" },
+        "password": { "type": "string", "description": "Senha criptografada via bcryptjs" },
+        "name": { "type": "string", "description": "Nome de exibição do usuário" },
+        "role": { "type": "string", "enum": ["admin", "user"], "description": "Função/permissão do usuário" },
+        "active": { "type": "boolean", "description": "Status de ativação do usuário" }
+      },
+      "required": ["username", "password", "name", "role", "active"]
     }
   },
   "firestore": {
@@ -143,6 +156,10 @@
     "system_backups/{backupId}": {
       "schema": "backupMetadata",
       "description": "Coleção de metadados e arquivos de backup automático/manual salvos no sistema"
+    },
+    "users/{userId}": {
+      "schema": "customUser",
+      "description": "Coleção de contas de usuários CRM"
     }
   }
 }
