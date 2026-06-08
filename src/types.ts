@@ -49,6 +49,7 @@ export interface AiAnalysisLog {
   supplier?: string;
   modelUsed?: string;
   errorCode?: string | number;
+  geminiKeyUsed?: string;
 }
 
 export interface ExcludedOrderBackup {

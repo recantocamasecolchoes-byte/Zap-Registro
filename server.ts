@@ -68,12 +68,25 @@ const rapidPedidoSchema = {
 
 app.post("/api/gemini/parse-pedido", async (req, res) => {
   try {
-    const { text, rapidMode } = req.body;
+    const { text, rapidMode, apiKey } = req.body;
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "O texto do pedido é obrigatório." });
     }
 
-    const ai = getGenAI();
+    let ai;
+    if (apiKey) {
+      ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+    } else {
+      ai = getGenAI();
+    }
+
     let prompt;
     let schemaToUse;
     let systemInstruction;
@@ -93,15 +106,24 @@ Ficha de entrada:
       systemInstruction = "Você é um assistente administrativo de logística em uma fábrica de móveis. Extraia as informações estruturadas de mensagens textuais do WhatsApp com precisão. Preste muita atenção na identificação da cidade e estado (UF) no endereço, CEP, Bairro, contexto do pedido ou texto da conversa. Identifique com precisão se é um caso de RETIRADA (e.g. 'Retirada', 'Retirar', 'Retira na loja', 'Retirada na fábrica', 'Cliente retira', 'Retirada no local') e nesse caso preencha city como 'RETIRADA' e state vazio. Se nenhuma informação de cidade/retirada for encontrada de forma alguma, preencha city como 'NÃO INFORMADO'.";
     }
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: schemaToUse,
-        systemInstruction
-      }
-    });
+    // Use Promise.race to set a solid server-side timeout of 10 seconds for the Google GenAI API request
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: schemaToUse,
+          systemInstruction
+        }
+      }),
+      new Promise<any>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("O servidor do Gemini excedeu o limite de tempo (TIMEOUT_10S). Verifique se a sua Chave de API Gemini está ativa, autorizada e correta. Caso sua chave de API inserida manualmente seja inválida, mude ou remova a chave para usar o servidor padrão.")),
+          10000
+        )
+      )
+    ]);
 
     const textResult = response.text;
     if (!textResult) {
@@ -147,7 +169,7 @@ const entregaSchema = {
 
 app.post("/api/gemini/parse-entregue", async (req, res) => {
   try {
-    const { text, activeOrders } = req.body;
+    const { text, activeOrders, apiKey } = req.body;
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "O texto de entrega é obrigatório." });
     }
@@ -159,7 +181,20 @@ app.post("/api/gemini/parse-entregue", async (req, res) => {
       return res.json({ success: true, matchedOrderId: null, reason: "Nenhum pedido ativo para correspondência." });
     }
 
-    const ai = getGenAI();
+    let ai;
+    if (apiKey) {
+      ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+    } else {
+      ai = getGenAI();
+    }
+
     const activeOrdersListString = activeOrders.map(o => `ID: "${o.id}" | Cliente: "${o.nomeCompleto}" | Produto: "${o.produto}"`).join("\n");
     
     const prompt = `Identifique qual dos pedidos ativos abaixo corresponde à mensagem de confirmação de entrega.
@@ -171,15 +206,24 @@ ${activeOrdersListString}
 
 DICA: Se o texto for simples como "João Silva entregue", procure por "João Silva" na lista de pedidos ativos. Responda com o correspondente correto seguindo o padrão de JSON.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: entregaSchema,
-        systemInstruction: "Você é um assistente de despacho que correlaciona mensagens curtas de entregadores do WhatsApp (ex: 'João Silva entregue' ou 'Cama preta da Maria entregue') a pedidos cadastrados no banco de dados."
-      }
-    });
+    // Use Promise.race to set a solid server-side timeout of 10 seconds for the Google GenAI API request
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: entregaSchema,
+          systemInstruction: "Você é um assistente de despacho que correlaciona mensagens curtas de entregadores do WhatsApp (ex: 'João Silva entregue' ou 'Cama preta da Maria entregue') a pedidos cadastrados no banco de dados."
+        }
+      }),
+      new Promise<any>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("O servidor do Gemini excedeu o limite de tempo (TIMEOUT_10S). Verifique se a sua Chave de API Gemini está ativa, autorizada e correta. Caso sua chave de API inserida manualmente seja inválida, mude ou remova a chave para usar o servidor padrão.")),
+          10000
+        )
+      )
+    ]);
 
     const textResult = response.text;
     if (!textResult) {

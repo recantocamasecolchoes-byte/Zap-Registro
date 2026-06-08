@@ -323,6 +323,9 @@ export function subscribePedidos(
  * Saves a new Pedido or overwrites an existing one
  */
 export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, byUser?: string): Promise<string> {
+  if (!pedido.supplier) {
+    throw new Error("Selecione o fornecedor.");
+  }
   const rawStatus = (pedido.status || 'PENDING') as any;
   const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
     (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
@@ -429,7 +432,7 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
     rescheduleDate: pedido.rescheduleDate || pedido.dataReagendamento || '',
     textoOriginal: pedido.textoOriginal,
     observacoes: pedido.observacoes,
-    supplier: pedido.supplier || 'SOFIA_HOME_DECOR',
+    supplier: pedido.supplier,
     updatedAt: isFirebaseConfigured ? serverTimestamp() : Date.now()
   };
 
@@ -1029,7 +1032,7 @@ export async function excludeOrderWithBackup(
 
   // 2. Delete from active sales
   console.log("[DEBUG excludeOrderWithBackup] Deletando pedido original:", pedido.id);
-  await deletePedido(pedido.id);
+  await deletePedido(pedido.id, pedido.supplier);
   console.log("[DEBUG excludeOrderWithBackup] Exclusão e backup concluídos com sucesso.");
 }
 
