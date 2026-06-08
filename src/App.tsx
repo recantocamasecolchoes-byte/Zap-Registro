@@ -87,6 +87,38 @@ import {
   signOut
 } from 'firebase/auth';
 
+const getSupplierKeyByName = (name: string): 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS' => {
+  if (name === 'Sofia Home Decor') return 'SOFIA_HOME_DECOR';
+  if (name === 'Michael') return 'MICHAEL';
+  if (name === 'Frank') return 'FRANK';
+  return 'OUTROS';
+};
+
+const getSupplierNameByKey = (key?: string): string => {
+  if (key === 'SOFIA_HOME_DECOR') return 'Sofia Home Decor';
+  if (key === 'MICHAEL') return 'Michael';
+  if (key === 'FRANK') return 'Frank';
+  return 'Outros Fornecedores';
+};
+
+const parseBrazilianNumber = (valStr: string): number => {
+  if (!valStr) return 0;
+  let cleaned = valStr.trim();
+  // Strip thousands separators but preserve decimal commas/periods
+  if (cleaned.includes(',') && cleaned.includes('.')) {
+    cleaned = cleaned.replace(/\./g, '').replace(/,/g, '.');
+  } else if (cleaned.includes(',')) {
+    cleaned = cleaned.replace(/,/g, '.');
+  }
+  const parsed = parseFloat(cleaned);
+  return isNaN(parsed) ? 0 : parsed;
+};
+
+const formatBrazilianNumber = (num: number): string => {
+  if (num === undefined || num === null || isNaN(num)) return '';
+  return num.toLocaleString('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+};
+
 export default function App() {
   // Database state
   const [pedidos, setPedidos] = useState<Pedido[]>([]);
@@ -225,9 +257,31 @@ export default function App() {
     return 'SOFIA_HOME_DECOR';
   });
 
+  // Mandatory Supplier Selection
+  const [fornecedorSelecionado, setFornecedorSelecionado] = useState<string>(() => {
+    if (currentSupplier === 'SOFIA_HOME_DECOR') return 'Sofia Home Decor';
+    if (currentSupplier === 'MICHAEL') return 'Michael';
+    if (currentSupplier === 'FRANK') return 'Frank';
+    if (currentSupplier === 'OUTROS') return 'Outros Fornecedores';
+    return '';
+  });
+
   // Persist current active supplier
   useEffect(() => {
     localStorage.setItem('iazap_current_supplier', currentSupplier);
+  }, [currentSupplier]);
+
+  // Synchronize tabs from active selections
+  useEffect(() => {
+    if (currentSupplier === 'SOFIA_HOME_DECOR') {
+      setFornecedorSelecionado('Sofia Home Decor');
+    } else if (currentSupplier === 'MICHAEL') {
+      setFornecedorSelecionado('Michael');
+    } else if (currentSupplier === 'FRANK') {
+      setFornecedorSelecionado('Frank');
+    } else if (currentSupplier === 'OUTROS') {
+      setFornecedorSelecionado('Outros Fornecedores');
+    }
   }, [currentSupplier]);
 
   // Derived filtered orders list for active supplier tab
@@ -252,6 +306,21 @@ export default function App() {
   // Form editing state
   const [editingPedido, setEditingPedido] = useState<Partial<Pedido> | null>(null);
   const [comissaoPercent, setComissaoPercent] = useState<number>(10); // Default 10%
+  const [comissaoInputText, setComissaoInputText] = useState<string>('');
+  const [showConfirmationStep, setShowConfirmationStep] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (editingPedido) {
+      if (editingPedido.comissao !== undefined && editingPedido.comissao !== null) {
+        setComissaoInputText(formatBrazilianNumber(editingPedido.comissao));
+      } else {
+        setComissaoInputText('');
+      }
+    } else {
+      setComissaoInputText('');
+      setShowConfirmationStep(false);
+    }
+  }, [editingPedido?.id, editingPedido?.numeroVenda, editingPedido?.comissao]);
 
   // Global Toast alerts
   const [notification, setNotification] = useState<{ type: 'success' | 'refused' | 'error' | 'info'; message: string } | null>(null);
@@ -1214,6 +1283,10 @@ export default function App() {
 
   // 1. CADASTRO INTELIGENTE DE PEDIDOS COM IA (WA Paste Interpreter)
   const handleParseWhatsAppOrder = async () => {
+    if (!fornecedorSelecionado) {
+      triggerToast('error', 'Selecione um fornecedor antes de continuar.');
+      return;
+    }
     if (!pasteOrderText.trim()) {
       triggerToast('error', 'Por favor, cole um texto de pedido do WhatsApp.');
       return;
@@ -1258,9 +1331,11 @@ export default function App() {
       const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
       const totalVal = Number(localParsed.valorTotal) || 0;
-      let finalComis = Number(localParsed.comissaoSugerida) || 0;
-      if (finalComis === 0 && totalVal > 0) {
-        finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
+      let finalComis: number | undefined = undefined;
+      if (fornecedorSelecionado === 'Sofia Home Decor') {
+        finalComis = Number((totalVal * 0.1).toFixed(2));
+      } else {
+        finalComis = undefined;
       }
 
       setEditingPedido({
@@ -1281,7 +1356,7 @@ export default function App() {
         status: 'PENDING',
         textoOriginal: pasteOrderText,
         observacoes: localParsed.observacoes || 'Extraído via Modo Análise Rápida local',
-        supplier: currentSupplier
+        supplier: getSupplierKeyByName(fornecedorSelecionado)
       });
 
       triggerToast('success', 'Ficha processada em Modo Rápido com sucesso! (Sem uso de IA)');
@@ -1362,9 +1437,11 @@ export default function App() {
       const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
       const totalVal = Number(localParsed.valorTotal) || 0;
-      let finalComis = Number(localParsed.comissaoSugerida) || 0;
-      if (finalComis === 0 && totalVal > 0) {
-        finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
+      let finalComis: number | undefined = undefined;
+      if (fornecedorSelecionado === 'Sofia Home Decor') {
+        finalComis = Number((totalVal * 0.1).toFixed(2));
+      } else {
+        finalComis = undefined;
       }
 
       setEditingPedido({
@@ -1385,7 +1462,7 @@ export default function App() {
         status: 'PENDING',
         textoOriginal: pasteOrderText,
         observacoes: localParsed.observacoes || 'Extraído via Parser Local Inteligente',
-        supplier: currentSupplier
+        supplier: getSupplierKeyByName(fornecedorSelecionado)
       });
 
       triggerToast('success', 'Ficha processada localmente com sucesso! (Economizado crédito de IA)');
@@ -1485,9 +1562,11 @@ export default function App() {
       const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
       const totalVal = Number(extracted.valorTotal) || 0;
-      let finalComis = Number(extracted.comissaoSugerida) || 0;
-      if (finalComis === 0 && totalVal > 0) {
-        finalComis = Number((totalVal * (comissaoPercent / 100)).toFixed(2));
+      let finalComis: number | undefined = undefined;
+      if (fornecedorSelecionado === 'Sofia Home Decor') {
+        finalComis = Number((totalVal * 0.1).toFixed(2));
+      } else {
+        finalComis = undefined;
       }
 
       setEditingPedido({
@@ -1508,7 +1587,7 @@ export default function App() {
         status: 'PENDING',
         textoOriginal: pasteOrderText,
         observacoes: extracted.observacoes || '',
-        supplier: currentSupplier
+        supplier: getSupplierKeyByName(fornecedorSelecionado)
       });
 
       triggerToast('success', 'Ficha interpretada pela IA com sucesso! Verifique os dados abaixo.');
@@ -1544,6 +1623,14 @@ export default function App() {
       const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
       const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
+      const totalVal = Number(localParsed.valorTotal) || 0;
+      let finalComis: number | undefined = undefined;
+      if (fornecedorSelecionado === 'Sofia Home Decor') {
+        finalComis = Number((totalVal * 0.1).toFixed(2));
+      } else {
+        finalComis = undefined;
+      }
+
       setEditingPedido({
         numeroVenda: nextNum,
         data: formattedDate,
@@ -1557,12 +1644,12 @@ export default function App() {
         cor: localParsed.cor || '',
         quantidade: Number(localParsed.quantidade) || 1,
         formaPagamento: localParsed.formaPagamento || 'PIX',
-        valorTotal: localParsed.valorTotal || 0,
-        comissao: localParsed.comissaoSugerida || 0,
+        valorTotal: totalVal,
+        comissao: finalComis,
         status: 'PENDING',
         textoOriginal: pasteOrderText, // Nunca esvazia e nunca perde o texto original
         observacoes: localParsed.observacoes || 'Extraído via Fallback de Emergência',
-        supplier: currentSupplier
+        supplier: getSupplierKeyByName(fornecedorSelecionado)
       });
 
       setAiAnalysisError("IA temporariamente indisponível. Você pode continuar utilizando o cadastro manual.");
@@ -1616,7 +1703,7 @@ export default function App() {
         const index = pedidos.find(p => p.id === matchedId);
         
         if (index) {
-          await updatePedidoStatus(matchedId, 'DELIVERED', undefined, currentUser?.name || currentUser?.username || 'Sistema');
+          await updatePedidoStatus(matchedId, 'DELIVERED', undefined, currentUser?.name || currentUser?.username || 'Sistema', index.supplier);
           triggerToast('success', `Confirmado! Pedido ${index.numeroVenda} (${index.nomeCompleto}) marcado como Entregue via IA.`);
           setPasteDeliveryText('');
         } else {
@@ -1638,6 +1725,11 @@ export default function App() {
     e.preventDefault();
     if (!editingPedido) return;
 
+    if (!fornecedorSelecionado) {
+      triggerToast('error', 'Selecione um fornecedor antes de continuar.');
+      return;
+    }
+
     if (!editingPedido.nomeCompleto?.trim()) {
       triggerToast('error', 'Campo obrigatório faltando: Nome completo do cliente.');
       return;
@@ -1650,13 +1742,22 @@ export default function App() {
       triggerToast('error', 'Campo obrigatório faltando ou incorreto: Valor Total.');
       return;
     }
-    if (editingPedido.comissao === undefined || isNaN(editingPedido.comissao)) {
-      triggerToast('error', 'Campo obrigatório faltando ou incorreto: Comissão.');
+
+    const parsedComissao = parseBrazilianNumber(comissaoInputText);
+    if (!comissaoInputText.trim() || isNaN(parsedComissao) || parsedComissao <= 0) {
+      triggerToast('error', 'Informe o valor da comissão.');
       return;
     }
 
+    // Set comissao on local state and trigger confirmation screen overlay
+    setEditingPedido(prev => prev ? { ...prev, comissao: parsedComissao } : null);
+    setShowConfirmationStep(true);
+  };
+
+  // Perform absolute/definitive saving to database or offline storage after user clicks confirmation
+  const executeDefinitiveSave = async () => {
+    if (!editingPedido) return;
     try {
-      // Construct logical payload
       const payload: Omit<Pedido, "id"> & { id?: string } = {
         id: editingPedido.id,
         numeroVenda: editingPedido.numeroVenda || generateNextNumeroVenda(currentSupplierPedidos),
@@ -1678,7 +1779,7 @@ export default function App() {
         rescheduleDate: editingPedido.rescheduleDate || editingPedido.dataReagendamento || '',
         textoOriginal: editingPedido.textoOriginal || `PEDIDO MANUAL\nCliente: ${editingPedido.nomeCompleto}\nProduto: ${editingPedido.produto}`,
         observacoes: editingPedido.observacoes || '',
-        supplier: editingPedido.supplier || currentSupplier
+        supplier: getSupplierKeyByName(fornecedorSelecionado)
       };
 
       await savePedido(payload, currentUser?.name || currentUser?.username || 'Sistema');
@@ -1688,9 +1789,10 @@ export default function App() {
       
       triggerToast('success', `Pedido ${payload.numeroVenda} de ${payload.nomeCompleto} salvo com sucesso!`);
       
-      // Clean form states
+      // Clean form states and confirmation overlay
       setEditingPedido(null);
       setPasteOrderText('');
+      setShowConfirmationStep(false);
     } catch (err: any) {
       console.error(err);
       const readableError = parseFirebaseError(err);
@@ -1719,7 +1821,7 @@ export default function App() {
         console.log("Novo status:", "RESCHEDULED");
         console.log("Nova data:", extra.dataReagendamento);
       }
-      await updatePedidoStatus(id, newStatus, extra, currentUser?.name || currentUser?.username || 'Sistema');
+      await updatePedidoStatus(id, newStatus, extra, currentUser?.name || currentUser?.username || 'Sistema', updated.supplier);
       if (newStatus === 'RESCHEDULED') {
         setCurrentTab('reagendados');
         setSelectedStatuses(['Todos']);
@@ -1923,7 +2025,8 @@ export default function App() {
   const handleCancelPedido = async (id: string) => {
     if (window.confirm("Tem certeza que deseja cancelar este pedido?")) {
       try {
-        await updatePedidoStatus(id, 'CANCELLED', undefined, currentUser?.name || currentUser?.username || 'Sistema');
+        const targeted = pedidos.find(p => p.id === id);
+        await updatePedidoStatus(id, 'CANCELLED', undefined, currentUser?.name || currentUser?.username || 'Sistema', targeted?.supplier);
         triggerToast('success', 'Pedido cancelado com sucesso!');
         setSelectedPedido(null);
         setShowDropdownId(null);
@@ -2231,6 +2334,10 @@ export default function App() {
 
   // Create manual blank order row in Spreadsheet view mode
   const handleAddNewManualRowSpreadsheet = async () => {
+    if (!fornecedorSelecionado) {
+      triggerToast('error', 'Selecione um fornecedor antes de continuar.');
+      return;
+    }
     const today = new Date();
     const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
     const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
@@ -2251,7 +2358,7 @@ export default function App() {
       status: 'PENDING',
       textoOriginal: `PEDIDO MANUAL SEQUENCIAL ${nextNum}`,
       observacoes: "",
-      supplier: currentSupplier
+      supplier: getSupplierKeyByName(fornecedorSelecionado)
     };
 
     try {
@@ -2574,6 +2681,34 @@ export default function App() {
                 <p className="text-xs text-slate-500 leading-relaxed">
                   Copie a ficha inteira ou mensagem de conversa enviada pelo cliente ou vendedor e cole no campo de texto abaixo. A IA interpretará e preencherá a estrutura automaticamente.
                 </p>
+
+                {/* OBRIGATÓRIO: SELEÇÃO DE FORNECEDOR */}
+                <div className="mt-3 mb-2 bg-slate-50/80 border border-slate-200 rounded-2xl p-3.5">
+                  <label htmlFor="select-supplier-mandatory" className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                    <span>Fornecedor (Campo Obrigatório) *</span>
+                  </label>
+                  <select
+                    id="select-supplier-mandatory"
+                    value={fornecedorSelecionado}
+                    required
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setFornecedorSelecionado(val);
+                      if (val) {
+                        const supplierKey = getSupplierKeyByName(val);
+                        setCurrentSupplier(supplierKey);
+                      }
+                    }}
+                    className="w-full text-xs font-bold bg-white p-2.5 text-slate-800 border border-slate-200 focus:border-brand focus:ring-1 focus:ring-brand outline-none rounded-xl shadow-xs transition cursor-pointer"
+                  >
+                    <option value="">-- Selecione o Fornecedor antes de continuar --</option>
+                    <option value="Sofia Home Decor">Sofia Home Decor</option>
+                    <option value="Michael">Michael</option>
+                    <option value="Frank">Frank</option>
+                    <option value="Outros Fornecedores">Outros Fornecedores</option>
+                  </select>
+                </div>
+
                 <textarea
                   id="textarea-colar-pedido"
                   rows={4}
@@ -2620,6 +2755,10 @@ export default function App() {
                           type="button"
                           id="btn-ai-error-manual"
                           onClick={() => {
+                            if (!fornecedorSelecionado) {
+                              triggerToast('error', 'Selecione um fornecedor antes de continuar.');
+                              return;
+                            }
                             setAiAnalysisError(null);
                             const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
                             setEditingPedido({
@@ -2636,11 +2775,11 @@ export default function App() {
                               quantidade: 1,
                               formaPagamento: 'PIX',
                               valorTotal: 0,
-                              comissao: 0,
+                              comissao: undefined,
                               status: 'PENDING',
                               textoOriginal: pasteOrderText || 'Ficha Cadastrada Manualmente (Fallback erro IA)',
                               observacoes: '',
-                              supplier: currentSupplier
+                              supplier: getSupplierKeyByName(fornecedorSelecionado)
                             });
                           }}
                           className="bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-extrabold text-[10px] py-1.5 px-3 rounded-xl transition cursor-pointer shadow-2xs"
@@ -2682,6 +2821,10 @@ export default function App() {
                   <button
                     id="btn-create-manual-fallback"
                     onClick={() => {
+                      if (!fornecedorSelecionado) {
+                        triggerToast('error', 'Selecione um fornecedor antes de continuar.');
+                        return;
+                      }
                       const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
                       setEditingPedido({
                         numeroVenda: nextNum,
@@ -2697,11 +2840,11 @@ export default function App() {
                         quantidade: 1,
                         formaPagamento: 'PIX',
                         valorTotal: 0,
-                        comissao: 0,
+                        comissao: undefined,
                         status: 'PENDING',
                         textoOriginal: 'Ficha Cadastrada Manualmente',
                         observacoes: '',
-                        supplier: currentSupplier
+                        supplier: getSupplierKeyByName(fornecedorSelecionado)
                       });
                     }}
                     className="bg-white border border-slate-200 hover:border-slate-300 text-slate-700 hover:bg-slate-50 text-xs py-2.5 px-4.5 rounded-full font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
@@ -2797,6 +2940,78 @@ export default function App() {
                 className="overflow-hidden"
               >
                 <div className="bg-slate-50 border border-slate-200/90 rounded-3xl p-5 sm:p-6 shadow-xs">
+                  {showConfirmationStep ? (
+                    <div>
+                      <div className="flex items-center gap-2 text-brand border-b border-slate-200 pb-3 mb-5">
+                        <CheckCircle className="w-5 h-5 text-brand animate-bounce" />
+                        <h3 className="font-sans font-extrabold text-base text-slate-900">
+                          Confirmar Comissão Obrigatória antes de Salvar
+                        </h3>
+                        <span className="text-xs bg-slate-200 text-slate-800 font-mono font-bold px-2.5 py-0.5 rounded-lg">
+                          Venda {editingPedido.numeroVenda}
+                        </span>
+                      </div>
+
+                      <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4 mb-6">
+                        <p className="text-xs font-semibold text-slate-600 leading-relaxed">
+                          A IA não decide nem salva comissões automaticamente. Confirme os valores calculados/digitados abaixo antes do envio final para o banco de dados:
+                        </p>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+                          <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider font-extrabold text-slate-400">Fornecedor</span>
+                            <span className="text-xs font-black text-slate-800">{fornecedorSelecionado}</span>
+                          </div>
+
+                          <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider font-extrabold text-slate-400">Cliente</span>
+                            <span className="text-xs font-black text-slate-800">{editingPedido.nomeCompleto || 'Manual/Não extraído'}</span>
+                          </div>
+
+                          <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 sm:col-span-2 flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider font-extrabold text-slate-400">Produto</span>
+                            <span className="text-xs font-bold text-slate-700">{editingPedido.produto || 'Sem descrição'}</span>
+                          </div>
+
+                          <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider font-extrabold text-slate-400">Valor Total da Venda</span>
+                            <span className="text-xs font-black text-slate-900">R$ {formatBrazilianNumber(editingPedido.valorTotal || 0)}</span>
+                          </div>
+
+                          <div className="bg-brand/5 p-3 rounded-xl border border-brand/20 flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider font-extrabold text-brand">Comissão Atribuída (Confirmada) *</span>
+                            <span className="text-sm font-black text-brand">R$ {comissaoInputText}</span>
+                          </div>
+                        </div>
+
+                        <div className="p-3.5 bg-blue-50/60 rounded-xl border border-blue-100 text-[11px] text-blue-800 flex items-start gap-2">
+                          <AlertCircle className="w-4 h-4 text-blue-500 shrink-0 mt-0.5" />
+                          <span>Ao salvar, as estatísticas de comissões pendentes para <strong>{fornecedorSelecionado}</strong> serão atualizadas em tempo real.</span>
+                        </div>
+                      </div>
+
+                      <div className="flex justify-end gap-3">
+                        <button
+                          type="button; button-voltar-da-confirmacao"
+                          id="btn-voltar-da-confirmacao"
+                          onClick={() => setShowConfirmationStep(false)}
+                          className="px-4 py-1.5 text-xs text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-50 rounded-full border border-slate-200 hover:border-slate-300 font-bold transition shadow-xs cursor-pointer"
+                        >
+                          Voltar e Alterar
+                        </button>
+                        <button
+                          type="button; button-save-da-confirmacao"
+                          id="btn-save-da-confirmacao"
+                          onClick={executeDefinitiveSave}
+                          className="bg-brand hover:bg-brand-hover text-white text-xs py-2.5 px-6 rounded-full font-bold transition flex items-center gap-1.5 shadow-sm cursor-pointer"
+                        >
+                          <Check className="w-4 h-4" />
+                          Salvar Definitivamente
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
                   <div className="flex items-center justify-between border-b border-slate-200 pb-3 mb-4">
                     <div className="flex items-center gap-2 text-brand">
                       <Edit className="w-5 h-5 text-brand" />
@@ -2818,8 +3033,35 @@ export default function App() {
                   <form onSubmit={handleSavePedidoForm} className="space-y-4">
                     
                     {/* General rows */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                       
+                      {/* Fornecedor */}
+                      <div>
+                        <label htmlFor="form-supplier-dropdown" className="block text-[10px] font-extrabold text-slate-700 uppercase tracking-wider mb-1 flex items-center gap-1">
+                          <span>Fornecedor (Obrigatório) *</span>
+                        </label>
+                        <select
+                          id="form-supplier-dropdown"
+                          value={fornecedorSelecionado}
+                          required
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setFornecedorSelecionado(val);
+                            if (val) {
+                              const supplierKey = getSupplierKeyByName(val);
+                              setCurrentSupplier(supplierKey);
+                            }
+                          }}
+                          className="w-full text-xs font-semibold bg-white p-2.5 text-slate-800 border border-slate-200 focus:border-brand focus:ring-1 focus:ring-brand outline-none rounded-xl shadow-xs transition cursor-pointer"
+                        >
+                          <option value="">-- Escolha o Fornecedor --</option>
+                          <option value="Sofia Home Decor">Sofia Home Decor</option>
+                          <option value="Michael">Michael</option>
+                          <option value="Frank">Frank</option>
+                          <option value="Outros Fornecedores">Outros Fornecedores</option>
+                        </select>
+                      </div>
+
                       {/* Cliente */}
                       <div>
                         <label className="block text-[10px] font-extrabold text-slate-500 uppercase tracking-wider mb-1">Nome Completo do Cliente *</label>
@@ -2957,42 +3199,38 @@ export default function App() {
                           value={editingPedido.valorTotal !== undefined ? editingPedido.valorTotal : ''}
                           onChange={(e) => {
                             const val = parseFloat(e.target.value) || 0;
-                            updateComissaoSuggestion(val, comissaoPercent);
+                            if (fornecedorSelecionado === 'Sofia Home Decor') {
+                              setEditingPedido(prev => prev ? { ...prev, valorTotal: val, comissao: Number((val * 0.1).toFixed(2)) } : null);
+                            } else {
+                              setEditingPedido(prev => prev ? { ...prev, valorTotal: val } : null);
+                            }
                           }}
-                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
+                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none font-bold text-slate-800 animate-pulse-once"
                         />
                       </div>
 
                       {/* Comissão editável e calculável */}
                       <div>
                         <div className="flex items-center justify-between mb-1">
-                          <label className="block text-xs font-bold text-natural-muted uppercase">Comissão (R$)</label>
-                          
-                          {/* Slider or selection tool */}
-                          <select 
-                            value={comissaoPercent}
-                            onChange={(e) => {
-                              const pct = parseInt(e.target.value, 10);
-                              setComissaoPercent(pct);
-                              updateComissaoSuggestion(editingPedido.valorTotal || 0, pct);
-                            }}
-                            className="text-[10px] bg-natural-accent px-1 py-0.5 rounded outline-none border border-natural-border-dark"
-                            title="Sugerir comissão automática"
-                          >
-                            <option value={5}>5%</option>
-                            <option value={8}>8%</option>
-                            <option value={10}>10%</option>
-                            <option value={12}>12%</option>
-                            <option value={15}>15%</option>
-                          </select>
+                          <label className="block text-xs font-bold text-natural-muted uppercase">Comissão (R$) *</label>
+                          {fornecedorSelecionado === 'Sofia Home Decor' && (
+                            <span className="text-[10px] font-extrabold text-blue-600 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-100 animate-pulse">
+                              Auto (10%)
+                            </span>
+                          )}
                         </div>
                         <input 
-                          type="number" 
-                          step="0.01"
+                          type="text" 
                           required
-                          value={editingPedido.comissao !== undefined ? editingPedido.comissao : ''}
-                          onChange={(e) => setEditingPedido(prev => prev ? { ...prev, comissao: parseFloat(e.target.value) || 0 } : null)}
-                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
+                          placeholder="Informe o valor da comissão (Ex: 100 ou 49,90)"
+                          value={comissaoInputText}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setComissaoInputText(raw);
+                            const parsed = parseBrazilianNumber(raw);
+                            setEditingPedido(prev => prev ? { ...prev, comissao: parsed } : null);
+                          }}
+                          className="w-full text-sm bg-white p-2.5 text-brand border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none font-black placeholder:text-slate-300"
                         />
                       </div>
 
@@ -3052,11 +3290,13 @@ export default function App() {
                         className="bg-brand hover:bg-brand-hover text-white text-xs py-2.5 px-6 rounded-full font-bold transition flex items-center gap-1.5 shadow-sm cursor-pointer"
                       >
                         <Check className="w-4 h-4" />
-                        Confirmar e Salvar Pedido
+                        Confirmar e Avançar para Confirmação
                       </button>
                     </div>
 
                   </form>
+                  </>
+                  )}
                 </div>
               </motion.div>
             )}
@@ -4049,7 +4289,7 @@ export default function App() {
                                 if (nextStat === 'RESCHEDULED') {
                                   handleQuickStatusUpdate(p.id, 'RESCHEDULED');
                                 } else {
-                                  await updatePedidoStatus(p.id, nextStat, undefined, currentUser?.name || currentUser?.username || 'Sistema');
+                                  await updatePedidoStatus(p.id, nextStat, undefined, currentUser?.name || currentUser?.username || 'Sistema', p.supplier);
                                   const readable = nextStat === 'PENDING' ? 'Pendente' :
                                                    nextStat === 'DELIVERED_UNPAID' ? 'Entregue e Não Pago' :
                                                    nextStat === 'CANCELLED' ? 'Cancelado' : 'Entregue';
@@ -4390,6 +4630,9 @@ export default function App() {
                   <button
                     onClick={() => {
                       setEditingPedido(selectedPedido);
+                      if (selectedPedido.supplier) {
+                        setFornecedorSelecionado(getSupplierNameByKey(selectedPedido.supplier));
+                      }
                       setSelectedPedido(null);
                     }}
                     className="bg-white border border-slate-200 text-slate-700 hover:bg-slate-55 text-xs py-2 px-3.5 rounded-full font-semibold transition flex items-center gap-1 cursor-pointer"

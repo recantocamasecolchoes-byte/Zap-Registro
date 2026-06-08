@@ -16,6 +16,13 @@ import { db, auth, isFirebaseConfigured, handleFirestoreError, OperationType } f
 import { Pedido, CustomUser } from './types';
 import bcrypt from 'bcryptjs';
 
+export function getCollectionNameBySupplier(supplier?: string): string {
+  if (supplier === 'SOFIA_HOME_DECOR' || supplier === 'Sofia Home Decor') return 'Sofia Home Decor';
+  if (supplier === 'MICHAEL' || supplier === 'Michael') return 'Michael';
+  if (supplier === 'FRANK' || supplier === 'Frank') return 'Frank';
+  return 'Outros Fornecedores';
+}
+
 // LocalStorage storage and sync for Custom Users
 let currentOfflineUsers: CustomUser[] = [];
 export const DEFAULT_SYSTEM_USERS: CustomUser[] = [
@@ -216,61 +223,86 @@ export function subscribePedidos(
 ): () => void {
   
   if (isFirebaseConfigured && db) {
-    const q = query(collection(db, "orders"), orderBy("createdAt", "desc"));
-    
-    // Setup snapshot listener
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const list: Pedido[] = [];
-      snapshot.forEach((docSnap) => {
-        const d = docSnap.data();
-        
-        // Normalize status to uppercase values
-        const rawStatus = d.status || 'PENDING';
-        const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
-          (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
-          (rawStatus === 'Reagendado' || rawStatus === 'Agendado' || rawStatus === 'RESCHEDULED') ? 'RESCHEDULED' :
-          (rawStatus === 'Entregue e Não Pago' || rawStatus === 'DELIVERED_UNPAID' || rawStatus === 'Entregue / N.P.') ? 'DELIVERED_UNPAID' :
-          (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
-          (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
+    const listNames = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
+    const activeUnsubscribes: (() => void)[] = [];
+    const latestData: { [col: string]: Pedido[] } = {};
 
-        list.push({
-          id: docSnap.id,
-          numeroVenda: d.numeroVenda || '',
-          data: d.data || '',
-          nomeCompleto: d.nomeCompleto || '',
-          telefone1: d.telefone1 || '',
-          telefone2: d.telefone2 || '',
-          endereco: d.endereco || '',
-          city: d.city || '',
-          state: d.state || '',
-          produto: d.produto || '',
-          cor: d.cor || '',
-          quantidade: d.quantidade || 1,
-          formaPagamento: d.formaPagamento || '',
-          valorTotal: typeof d.valorTotal === "number" ? d.valorTotal : parseFloat(d.valorTotal) || 0,
-          comissao: typeof d.comissao === "number" ? d.comissao : parseFloat(d.comissao) || 0,
-          status: mappedStatus,
-          dataReagendamento: d.dataReagendamento || d.rescheduleDate || '',
-          rescheduleDate: d.rescheduleDate || d.dataReagendamento || '',
-          textoOriginal: d.textoOriginal || '',
-          observacoes: d.observacoes || '',
-          supplier: d.supplier || 'SOFIA_HOME_DECOR',
-          userId: d.userId || '',
-          createdAt: d.createdAt?.seconds ? d.createdAt.seconds * 1000 : d.createdAt,
-          updatedAt: d.updatedAt?.seconds ? d.updatedAt.seconds * 1000 : d.updatedAt
-        });
-      });
-      // Sort in descending order to match expected structure
-      onUpdate(list);
-    }, (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, "orders");
-      } catch (formattedError: any) {
-        onError(formattedError);
+    const triggerMergedUpdate = () => {
+      let merged: Pedido[] = [];
+      for (const colName of listNames) {
+        if (latestData[colName]) {
+          merged = merged.concat(latestData[colName]);
+        }
       }
+      merged.sort((a, b) => {
+        const timeA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : (typeof a.createdAt === 'number' ? a.createdAt : (a.createdAt instanceof Date ? a.createdAt.getTime() : 0));
+        const timeB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : (typeof b.createdAt === 'number' ? b.createdAt : (b.createdAt instanceof Date ? b.createdAt.getTime() : 0));
+        return timeB - timeA;
+      });
+      onUpdate(merged);
+    };
+
+    listNames.forEach((colName) => {
+      const q = query(collection(db, colName), orderBy("createdAt", "desc"));
+      const unsub = onSnapshot(q, (snapshot) => {
+        const list: Pedido[] = [];
+        snapshot.forEach((docSnap) => {
+          const d = docSnap.data();
+          const rawStatus = d.status || 'PENDING';
+          const mappedStatus: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED' =
+            (rawStatus === 'Pendente' || rawStatus === 'PENDING') ? 'PENDING' :
+            (rawStatus === 'Reagendado' || rawStatus === 'Agendado' || rawStatus === 'RESCHEDULED') ? 'RESCHEDULED' :
+            (rawStatus === 'Entregue e Não Pago' || rawStatus === 'DELIVERED_UNPAID' || rawStatus === 'Entregue / N.P.') ? 'DELIVERED_UNPAID' :
+            (rawStatus === 'Entregue' || rawStatus === 'DELIVERED') ? 'DELIVERED' :
+            (rawStatus === 'CANCELLED' || rawStatus === 'Cancelado' || rawStatus === 'CANCELADO') ? 'CANCELLED' : 'PENDING';
+
+          const mappedSupplier: 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS' =
+            colName === "Sofia Home Decor" ? "SOFIA_HOME_DECOR" :
+            colName === "Michael" ? "MICHAEL" :
+            colName === "Frank" ? "FRANK" : "OUTROS";
+
+          list.push({
+            id: docSnap.id,
+            numeroVenda: d.numeroVenda || '',
+            data: d.data || '',
+            nomeCompleto: d.nomeCompleto || '',
+            telefone1: d.telefone1 || '',
+            telefone2: d.telefone2 || '',
+            endereco: d.endereco || '',
+            city: d.city || '',
+            state: d.state || '',
+            produto: d.produto || '',
+            cor: d.cor || '',
+            quantidade: d.quantidade || 1,
+            formaPagamento: d.formaPagamento || '',
+            valorTotal: typeof d.valorTotal === "number" ? d.valorTotal : parseFloat(d.valorTotal) || 0,
+            comissao: typeof d.comissao === "number" ? d.comissao : parseFloat(d.comissao) || 0,
+            status: mappedStatus,
+            dataReagendamento: d.dataReagendamento || d.rescheduleDate || '',
+            rescheduleDate: d.rescheduleDate || d.dataReagendamento || '',
+            textoOriginal: d.textoOriginal || '',
+            observacoes: d.observacoes || '',
+            supplier: d.supplier || mappedSupplier,
+            userId: d.userId || '',
+            createdAt: d.createdAt?.seconds ? d.createdAt.seconds * 1000 : d.createdAt,
+            updatedAt: d.updatedAt?.seconds ? d.updatedAt.seconds * 1000 : d.updatedAt
+          });
+        });
+        latestData[colName] = list;
+        triggerMergedUpdate();
+      }, (error) => {
+        try {
+          handleFirestoreError(error, OperationType.LIST, colName);
+        } catch (formattedError: any) {
+          onError(formattedError);
+        }
+      });
+      activeUnsubscribes.push(unsub);
     });
 
-    return unsubscribe;
+    return () => {
+      activeUnsubscribes.forEach(unsub => unsub());
+    };
   } else {
     // LocalStorage Mode
     const list = getLocalStoragePedidos();
@@ -413,19 +445,34 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
       payload.userId = auth.currentUser.uid;
     }
     
+    // Resolve correct collection
+    const targetColName = getCollectionNameBySupplier(pedido.supplier || 'OUTROS');
+    const allCollections = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
+    const collectionsToClean = allCollections.filter(c => c !== targetColName);
+
     try {
       if (pedido.id) {
-        const docRef = doc(db, "orders", pedido.id);
+        const docRef = doc(db, targetColName, pedido.id);
         await setDoc(docRef, payload, { merge: true });
+
+        // Cleanup potential duplicate of this ID in other active databases to prevent cross-supplier duplicates
+        for (const otherCol of collectionsToClean) {
+          try {
+            const staleRef = doc(db, otherCol, pedido.id);
+            await deleteDoc(staleRef);
+          } catch (e) {
+            // Silently ignore permission/existence errors during duplicate cleaning
+          }
+        }
         return pedido.id;
       } else {
         payload.createdAt = serverTimestamp();
-        const colRef = collection(db, "orders");
+        const colRef = collection(db, targetColName);
         const docRef = await addDoc(colRef, payload);
         return docRef.id;
       }
     } catch (err: any) {
-      handleFirestoreError(err, pedido.id ? OperationType.UPDATE : OperationType.CREATE, `orders/${pedido.id || 'new'}`);
+      handleFirestoreError(err, pedido.id ? OperationType.UPDATE : OperationType.CREATE, `${targetColName}/${pedido.id || 'new'}`);
     }
   } else {
     // LocalStorage mode
@@ -458,11 +505,11 @@ export async function updatePedidoStatus(
   id: string, 
   newStatus: any,
   extra?: { dataReagendamento?: string },
-  byUser?: string
+  byUser?: string,
+  supplier?: string
 ): Promise<void> {
   // 1. ADICIONAR LOGS COMPLETOS
-  console.log("Atualizando pedido...");
-  console.log("Pedido ID:", id);
+  console.log("Atualizando pedido...", id, "supplier:", supplier);
   console.log("Novo Status original:", newStatus);
   console.log("Usuário:", auth?.currentUser);
 
@@ -508,15 +555,34 @@ export async function updatePedidoStatus(
 
   if (isFirebaseConfigured && db) {
     try {
-      const docRef = doc(db, "orders", id);
-      await updateDoc(docRef, updatePayload);
-      console.log("Status atualizado com sucesso no Firestore: orders", id, "com", fileStatus);
+      const allCollections = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
+      if (supplier) {
+        const docRef = doc(db, getCollectionNameBySupplier(supplier), id);
+        await updateDoc(docRef, updatePayload);
+      } else {
+        // Try to update document in any of the four collections sequentially
+        let updatedAny = false;
+        for (const col of allCollections) {
+          try {
+            const docRef = doc(db, col, id);
+            await updateDoc(docRef, updatePayload);
+            updatedAny = true;
+            break;
+          } catch (e) {
+            // Silently scan next collection if not found
+          }
+        }
+        if (!updatedAny) {
+          console.warn(`[updatePedidoStatus] Could not locate document ${id} with status update in any collection.`);
+        }
+      }
+      console.log("Status atualizado com sucesso no Firestore:", id, "com", fileStatus);
     } catch (error: any) {
       console.error("ERRO FIREBASE DETALHADO:");
       console.error("Error Code:", error?.code);
       console.error("Error Message:", error?.message);
       console.error(error);
-      handleFirestoreError(error, OperationType.UPDATE, `orders/${id}`);
+      handleFirestoreError(error, OperationType.UPDATE, `orders-multisupplier/${id}`);
     }
   } else {
     const list = getLocalStoragePedidos();
@@ -538,18 +604,29 @@ export async function updatePedidoStatus(
 /**
  * Deletes a Pedido
  */
-export async function deletePedido(id: string): Promise<void> {
-  console.log("[DEBUG deletePedido] Iniciando exclusão de pedido no Firebase/LocalStorage. ID:", id);
+export async function deletePedido(id: string, supplier?: string): Promise<void> {
+  console.log("[DEBUG deletePedido] Iniciando exclusão de pedido no Firebase/LocalStorage. ID:", id, "supplier:", supplier);
   console.log("[DEBUG deletePedido] Firebase configurado:", isFirebaseConfigured, "DB ativo:", !!db);
   if (isFirebaseConfigured && db) {
     try {
-      const docRef = doc(db, "orders", id);
-      console.log("[DEBUG deletePedido] Referência criada com sucesso para caminho:", docRef.path);
-      await deleteDoc(docRef);
+      const allCollections = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
+      if (supplier) {
+        const docRef = doc(db, getCollectionNameBySupplier(supplier), id);
+        await deleteDoc(docRef);
+      } else {
+        for (const col of allCollections) {
+          try {
+            const docRef = doc(db, col, id);
+            await deleteDoc(docRef);
+          } catch (e) {
+            // Silently scan next
+          }
+        }
+      }
       console.log("[DEBUG deletePedido] Exclusão executada com sucesso no Firestore.");
     } catch (err: any) {
       console.error("[DEBUG deletePedido] Erro ao deletar documento no Firestore:", err);
-      handleFirestoreError(err, OperationType.DELETE, `orders/${id}`);
+      handleFirestoreError(err, OperationType.DELETE, `orders-multisupplier/${id}`);
     }
   } else {
     console.log("[DEBUG deletePedido] Usando modo offline / LocalStorage.");
@@ -753,10 +830,11 @@ export async function deleteBackup(id: string): Promise<void> {
 export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<void> {
   if (isFirebaseConfigured && db) {
     try {
-      // For each pedido, write to "orders"
+      // For each pedido, write to its corresponding supplier collection name
       for (const p of restoredPedidos) {
         const docId = p.id || `restored-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        const docRef = doc(db, "orders", docId);
+        const targetColName = getCollectionNameBySupplier(p.supplier || 'OUTROS');
+        const docRef = doc(db, targetColName, docId);
         
         // Sanitize & map inputs
         const rawStatus = p.status as any;
@@ -798,6 +876,16 @@ export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<
         }
         
         await setDoc(docRef, payload, { merge: true });
+        
+        // Cleanup document from other collections just in case of cross-supplier restore cleanups
+        const allCollections = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
+        const collectionsToClean = allCollections.filter(c => c !== targetColName);
+        for (const otherCol of collectionsToClean) {
+          try {
+            const staleRef = doc(db, otherCol, docId);
+            await deleteDoc(staleRef);
+          } catch (e) {}
+        }
       }
     } catch (err: any) {
       handleFirestoreError(err, OperationType.WRITE, "orders/restore");
