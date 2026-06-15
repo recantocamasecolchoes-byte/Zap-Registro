@@ -44,7 +44,7 @@ const pedidoSchema = {
     produto: { type: Type.STRING, description: "Nome do produto/móvel." },
     cor: { type: Type.STRING, description: "Cor ou estampa do produto/móvel, se mencionada." },
     quantidade: { type: Type.INTEGER, description: "Quantidade vendida. Se não for especificada, o padrão é 1." },
-    formaPagamento: { type: Type.STRING, description: "Forma de pagamento (PIX, Dinheiro, Cartão, Boleto, etc.)." },
+    formaPagamento: { type: Type.STRING, description: "Forma de pagamento, retorne obrigatoriamente um destes dois valores: 'À Vista' ou 'Parcelado'." },
     valorTotal: { type: Type.NUMBER, description: "Valor total do pedido (R$). Se não encontrar, retornar 0." },
     comissaoSugerida: { type: Type.NUMBER, description: "Valor de comissão estimado em R$. Se não estiver explícito, sugerir 15% do valor total." },
     observacoes: { type: Type.STRING, description: "Observações extras ou informações como CNPJ e detalhes de agendamento." }
@@ -60,11 +60,47 @@ const rapidPedidoSchema = {
     city: { type: Type.STRING, description: "Cidade extraída do endereço ou do contexto do pedido. Se houver termos de retirada do móvel (ex: Retirada, Retirar, Retira na loja, Retirada na fábrica, Cliente retira, Retirada no local), retorne exatamente a palavra 'RETIRADA'. Se não houver nada, retorne 'NÃO INFORMADO'." },
     state: { type: Type.STRING, description: "Sigla do estado com 2 letras em maiúsculo (ex: SP, MG). Se não encontrar ou for RETIRADA, retornar vazio." },
     produto: { type: Type.STRING, description: "Nome do produto/móvel." },
-    formaPagamento: { type: Type.STRING, description: "Forma de pagamento." },
+    formaPagamento: { type: Type.STRING, description: "Forma de pagamento, retorne obrigatoriamente um destes dois valores: 'À Vista' ou 'Parcelado'." },
     valorTotal: { type: Type.NUMBER, description: "Valor de venda. Se não encontrar, retorne 0." }
   },
   required: ["nomeCompleto", "produto", "valorTotal"]
 };
+
+// Endpoint to validate a specific Gemini API key purely functionally
+app.post("/api/gemini/validate-key", async (req, res) => {
+  try {
+    const { apiKey } = req.body;
+    if (!apiKey) {
+      return res.status(400).json({ error: "A chave API é obrigatória." });
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: "Responda apenas 'OK' se ler isso.",
+      config: {
+        maxOutputTokens: 5,
+      }
+    });
+
+    if (response.text) {
+      return res.json({ success: true, message: "Chave validada com sucesso" });
+    } else {
+      return res.status(400).json({ error: "Chave inválida ou sem permissão" });
+    }
+  } catch (error: any) {
+    console.error("Erro na validação de chave:", error);
+    return res.status(400).json({ error: "Chave inválida ou sem permissão", details: error.message || error });
+  }
+});
 
 app.post("/api/gemini/parse-pedido", async (req, res) => {
   try {
@@ -143,7 +179,7 @@ Ficha de entrada:
         produto: parsedData.produto || "",
         cor: "",
         quantidade: 1,
-        formaPagamento: parsedData.formaPagamento || "PIX",
+        formaPagamento: parsedData.formaPagamento || "À Vista",
         valorTotal: Number(parsedData.valorTotal) || 0,
         comissaoSugerida: 0,
         observacoes: ""

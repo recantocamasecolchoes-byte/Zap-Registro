@@ -119,6 +119,24 @@ const formatBrazilianNumber = (num: number): string => {
   return num.toLocaleString('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 };
 
+function normalizeFormaPagamento(value: string | undefined | null): 'À Vista' | 'Parcelado' {
+  if (!value) return 'À Vista';
+  const val = value.trim().toUpperCase();
+  if (
+    val.includes('PARC') || 
+    val.includes('VEZES') || 
+    val.includes('CARTAO') || 
+    val.includes('CARTÃO') || 
+    val.includes('CRE') || 
+    val.includes('PRAZO') || 
+    val.includes('X') ||
+    val.includes('PARCELADO')
+  ) {
+    return 'Parcelado';
+  }
+  return 'À Vista';
+}
+
 export default function App() {
   // Database state
   const [pedidos, setPedidos] = useState<Pedido[]>([]);
@@ -341,6 +359,15 @@ export default function App() {
     return ['', '', '', ''];
   });
 
+  const [keyStatuses, setKeyStatuses] = useState<Record<number, 'none' | 'testing' | 'success' | 'failed'>>({
+    0: 'none',
+    1: 'none',
+    2: 'none',
+    3: 'none'
+  });
+
+  const [selectedPedidoIds, setSelectedPedidoIds] = useState<string[]>([]);
+
   // IA Consumption Control and Patterns Memory States
   const [aiDiagnostics, setAiDiagnostics] = useState(() => {
     try {
@@ -504,6 +531,11 @@ export default function App() {
     );
     return () => unsubscribe();
   }, []);
+
+  // Clear selection when switching supplier, category tabs, or viewMode
+  useEffect(() => {
+    setSelectedPedidoIds([]);
+  }, [currentSupplier, currentTab, viewMode]);
 
   // Toast dispatch helper
   const triggerToast = (type: 'success' | 'refused' | 'error' | 'info', message: string) => {
@@ -1348,7 +1380,7 @@ export default function App() {
         produto: localParsed.produto || '',
         cor: localParsed.cor || '',
         quantidade: Number(localParsed.quantidade) || 1,
-        formaPagamento: localParsed.formaPagamento || '',
+        formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
         valorTotal: totalVal,
         comissao: finalComis,
         status: 'PENDING',
@@ -1454,7 +1486,7 @@ export default function App() {
         produto: localParsed.produto || '',
         cor: localParsed.cor || '',
         quantidade: Number(localParsed.quantidade) || 1,
-        formaPagamento: localParsed.formaPagamento || '',
+        formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
         valorTotal: totalVal,
         comissao: finalComis,
         status: 'PENDING',
@@ -1628,7 +1660,7 @@ export default function App() {
         produto: extracted.produto || '',
         cor: extracted.cor || '',
         quantidade: Number(extracted.quantidade) || 1,
-        formaPagamento: extracted.formaPagamento || '',
+        formaPagamento: normalizeFormaPagamento(extracted.formaPagamento),
         valorTotal: totalVal,
         comissao: finalComis,
         status: 'PENDING',
@@ -1696,7 +1728,7 @@ export default function App() {
         produto: localParsed.produto || 'Produto não identificado',
         cor: localParsed.cor || '',
         quantidade: Number(localParsed.quantidade) || 1,
-        formaPagamento: localParsed.formaPagamento || 'PIX',
+        formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
         valorTotal: totalVal,
         comissao: finalComis,
         status: 'PENDING',
@@ -1899,6 +1931,117 @@ export default function App() {
     }
   };
 
+  const handleTestKeys = async () => {
+    let hasKeys = false;
+    const nextStatuses = { ...keyStatuses };
+    
+    // Set all state to testing or none
+    for (let idx = 0; idx < 4; idx++) {
+      const trimmed = aiKeys[idx] ? aiKeys[idx].trim() : "";
+      if (trimmed) {
+        nextStatuses[idx] = 'testing';
+        hasKeys = true;
+      } else {
+        nextStatuses[idx] = 'none';
+      }
+    }
+    
+    setKeyStatuses(nextStatuses);
+
+    if (!hasKeys) {
+      triggerToast('info', 'Por favor, insira pelo menos uma chave de API para testar.');
+      return;
+    }
+
+    triggerToast('info', 'Iniciando teste das chaves de API com o servidor...');
+
+    // Test each asynchronously / concurrently
+    await Promise.all(
+      [0, 1, 2, 3].map(async (idx) => {
+        const key = aiKeys[idx] ? aiKeys[idx].trim() : "";
+        if (!key) return;
+
+        try {
+          const res = await fetch("/api/gemini/validate-key", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ apiKey: key }),
+          });
+          const resJson = await res.json();
+          if (res.ok && resJson.success) {
+            setKeyStatuses(prev => ({ ...prev, [idx]: 'success' }));
+          } else {
+            setKeyStatuses(prev => ({ ...prev, [idx]: 'failed' }));
+          }
+        } catch (err) {
+          setKeyStatuses(prev => ({ ...prev, [idx]: 'failed' }));
+        }
+      })
+    );
+
+    triggerToast('success', 'Teste de chaves finalizado!');
+  };
+
+  const handleSaveAndValidateKeys = async () => {
+    localStorage.setItem('iazap_gemini_keys', JSON.stringify(aiKeys));
+    
+    // Check if there are any non-empty keys
+    const filledKeys = aiKeys.map((k, idx) => ({ key: k ? k.trim() : "", index: idx })).filter(item => item.key !== "");
+    
+    if (filledKeys.length === 0) {
+      triggerToast('success', 'Chaves limpas e salvas localmente!');
+      setKeyStatuses({ 0: 'none', 1: 'none', 2: 'none', 3: 'none' });
+      return;
+    }
+
+    // Mark the filled keys as 'testing'
+    const nextStatuses = { ...keyStatuses };
+    filledKeys.forEach(item => {
+      nextStatuses[item.index] = 'testing';
+    });
+    setKeyStatuses(nextStatuses);
+
+    triggerToast('info', 'Chaves salvas localmente! Validando comunicação com a API do Gemini...');
+
+    let anySuccess = false;
+    let anyFail = false;
+
+    await Promise.all(
+      filledKeys.map(async (item) => {
+        try {
+          const res = await fetch("/api/gemini/validate-key", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ apiKey: item.key }),
+          });
+          const resJson = await res.json();
+          if (res.ok && resJson.success) {
+            setKeyStatuses(prev => ({ ...prev, [item.index]: 'success' }));
+            anySuccess = true;
+          } else {
+            setKeyStatuses(prev => ({ ...prev, [item.index]: 'failed' }));
+            anyFail = true;
+          }
+        } catch (err) {
+          setKeyStatuses(prev => ({ ...prev, [item.index]: 'failed' }));
+          anyFail = true;
+        }
+      })
+    );
+
+    if (anyFail && !anySuccess) {
+      triggerToast('error', 'Chave inválida ou sem permissão');
+    } else if (anySuccess) {
+      triggerToast('success', 'Chave validada com sucesso');
+    } else {
+      triggerToast('success', 'Chaves salvas com sucesso!');
+    }
+  };
+
   // Fast manually trigger status update without AI
   const handleQuickStatusUpdate = async (id: string, newStatus: any, extra?: { dataReagendamento?: string }) => {
     const updated = pedidos.find(p => p.id === id);
@@ -1922,16 +2065,13 @@ export default function App() {
       }
       await updatePedidoStatus(id, newStatus, extra, currentUser?.name || currentUser?.username || 'Sistema', updated.supplier);
       if (newStatus === 'RESCHEDULED') {
-        setCurrentTab('reagendados');
         setSelectedStatuses(['Todos']);
-        triggerToast('success', `Pedido ${updated.numeroVenda} reagendado para ${extra?.dataReagendamento || ''} e movido para Notas Agendadas!`);
+        triggerToast('success', `Pedido ${updated.numeroVenda} reagendado para ${extra?.dataReagendamento || ''} com sucesso!`);
       } else if (newStatus === 'DELIVERED') {
-        setCurrentTab('entregues');
-        triggerToast('success', `Pedido ${updated.numeroVenda} marcado como Entregue e movido para a aba Pedidos Entregues!`);
+        triggerToast('success', `Pedido ${updated.numeroVenda} marcado como Entregue com sucesso!`);
       } else if (newStatus === 'CANCELLED') {
-        setCurrentTab('cancelados');
         setSelectedStatuses(['Todos']);
-        triggerToast('success', `Pedido ${updated.numeroVenda} foi cancelado com sucesso e movido para a aba de Cancelados!`);
+        triggerToast('success', `Pedido ${updated.numeroVenda} cancelado com sucesso!`);
       } else {
         const readableLabel = newStatus === 'PENDING' ? 'Pendente' :
                               newStatus === 'RESCHEDULED' ? 'Reagendado / Agendado' :
@@ -1944,6 +2084,121 @@ export default function App() {
       console.error(err);
       const readableError = parseFirebaseError(err);
       triggerToast('error', `Falha ao atualizar status: ${readableError}`);
+    }
+  };
+
+  const handleBulkMarkAsDelivered = async () => {
+    if (selectedPedidoIds.length === 0) return;
+    
+    triggerToast('info', `Atualizando ${selectedPedidoIds.length} pedidos para Entregue...`);
+    
+    let successCount = 0;
+    let failCount = 0;
+    
+    await Promise.all(
+      selectedPedidoIds.map(async (id) => {
+        const ped = pedidos.find(p => p.id === id);
+        if (!ped) return;
+        try {
+          await updatePedidoStatus(
+            id, 
+            'DELIVERED', 
+            undefined, 
+            currentUser?.name || currentUser?.username || 'Sistema', 
+            ped.supplier
+          );
+          successCount++;
+        } catch (err) {
+          console.error(`Erro ao atualizar pedido ${id} em lote:`, err);
+          failCount++;
+        }
+      })
+    );
+    
+    setSelectedPedidoIds([]);
+    
+    if (failCount === 0) {
+      triggerToast('success', `${successCount} pedidos marcados como Entregue com sucesso!`);
+    } else {
+      triggerToast('success', `${successCount} pedidos atualizados com sucesso. FALHAS: ${failCount}`);
+    }
+  };
+
+  const handleBulkUpdateStatus = async (newStatus: 'PENDING' | 'DELIVERED_UNPAID') => {
+    if (selectedPedidoIds.length === 0) return;
+    
+    const label = newStatus === 'PENDING' ? 'Pendente' : 'Entregue e Não Pago';
+    triggerToast('info', `Atualizando ${selectedPedidoIds.length} pedidos para ${label}...`);
+    
+    let successCount = 0;
+    let failCount = 0;
+    
+    await Promise.all(
+      selectedPedidoIds.map(async (id) => {
+        const ped = pedidos.find(p => p.id === id);
+        if (!ped) return;
+        try {
+          await updatePedidoStatus(
+            id, 
+            newStatus, 
+            undefined, 
+            currentUser?.name || currentUser?.username || 'Sistema', 
+            ped.supplier
+          );
+          successCount++;
+        } catch (err) {
+          console.error(`Erro ao atualizar pedido ${id} em lote:`, err);
+          failCount++;
+        }
+      })
+    );
+    
+    setSelectedPedidoIds([]);
+    
+    if (failCount === 0) {
+      triggerToast('success', `${successCount} pedidos atualizados para ${label} com sucesso!`);
+    } else {
+      triggerToast('success', `${successCount} pedidos atualizados com sucesso. FALHAS: ${failCount}`);
+    }
+  };
+
+  const handleBulkCancel = async () => {
+    if (selectedPedidoIds.length === 0) return;
+    
+    const confirmCancel = window.confirm(`Tem certeza de que deseja cancelar os ${selectedPedidoIds.length} pedidos selecionados?`);
+    if (!confirmCancel) return;
+    
+    triggerToast('info', `Cancelando ${selectedPedidoIds.length} pedidos...`);
+    
+    let successCount = 0;
+    let failCount = 0;
+    
+    await Promise.all(
+      selectedPedidoIds.map(async (id) => {
+        const ped = pedidos.find(p => p.id === id);
+        if (!ped) return;
+        try {
+          await updatePedidoStatus(
+            id, 
+            'CANCELLED', 
+            undefined, 
+            currentUser?.name || currentUser?.username || 'Sistema', 
+            ped.supplier
+          );
+          successCount++;
+        } catch (err) {
+          console.error(`Erro ao cancelar pedido ${id} em lote:`, err);
+          failCount++;
+        }
+      })
+    );
+    
+    setSelectedPedidoIds([]);
+    
+    if (failCount === 0) {
+      triggerToast('success', `${successCount} pedidos cancelados com sucesso!`);
+    } else {
+      triggerToast('success', `${successCount} pedidos cancelados com sucesso. FALHAS: ${failCount}`);
     }
   };
 
@@ -2451,7 +2706,7 @@ export default function App() {
       produto: "Novo Produto",
       cor: "",
       quantidade: 1,
-      formaPagamento: "A combinar",
+      formaPagamento: "À Vista",
       valorTotal: 0,
       comissao: 0,
       status: 'PENDING',
@@ -2900,7 +3155,7 @@ export default function App() {
                               produto: '',
                               cor: '',
                               quantidade: 1,
-                              formaPagamento: 'PIX',
+                              formaPagamento: 'À Vista',
                               valorTotal: 0,
                               comissao: undefined,
                               status: 'PENDING',
@@ -2979,7 +3234,7 @@ export default function App() {
                         produto: '',
                         cor: '',
                         quantidade: 1,
-                        formaPagamento: 'PIX',
+                        formaPagamento: 'À Vista',
                         valorTotal: 0,
                         comissao: undefined,
                         status: 'PENDING',
@@ -3119,6 +3374,19 @@ export default function App() {
                           <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 flex flex-col">
                             <span className="text-[10px] uppercase tracking-wider font-extrabold text-slate-400">Cliente</span>
                             <span className="text-xs font-black text-slate-800">{editingPedido.nomeCompleto || 'Manual/Não extraído'}</span>
+                          </div>
+
+                          <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 sm:col-span-2 flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider font-extrabold text-slate-400">Cidade</span>
+                            <span className="text-xs font-black text-slate-800">
+                              {(() => {
+                                if (!editingPedido.city) return "Cidade não informada";
+                                const cityUpper = editingPedido.city.trim().toUpperCase();
+                                if (cityUpper === "RETIRADA") return "RETIRADA";
+                                if (cityUpper === "NÃO INFORMADO" || cityUpper === "") return "Cidade não informada";
+                                return `${editingPedido.city}${editingPedido.state ? `/${editingPedido.state}` : ''}`;
+                              })()}
+                            </span>
                           </div>
 
                           <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 sm:col-span-2 flex flex-col">
@@ -3333,13 +3601,14 @@ export default function App() {
                       {/* Forma Pagamento */}
                       <div>
                         <label className="block text-xs font-bold text-natural-muted uppercase mb-1">Pagamento</label>
-                        <input 
-                          type="text" 
-                          placeholder="PIX, Cartão..."
-                          value={editingPedido.formaPagamento || ''}
+                        <select 
+                          value={editingPedido.formaPagamento === 'Parcelado' ? 'Parcelado' : 'À Vista'}
                           onChange={(e) => setEditingPedido(prev => prev ? { ...prev, formaPagamento: e.target.value } : null)}
-                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
-                        />
+                          className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none font-medium cursor-pointer"
+                        >
+                          <option value="À Vista">À Vista</option>
+                          <option value="Parcelado">Parcelado</option>
+                        </select>
                       </div>
 
                       {/* Valor Total */}
@@ -3842,7 +4111,23 @@ export default function App() {
               <div className="min-w-[850px]">
                 
                 {/* Headers */}
-                <div className="grid grid-cols-[1.3fr_0.8fr_1.3fr_0.8fr_1.1fr_90px] bg-slate-50 border-b border-slate-200 px-4 py-3.5 text-[10px] font-extrabold text-[#64748b] uppercase tracking-wider font-sans">
+                <div className="grid grid-cols-[40px_1.3fr_0.8fr_1.3fr_0.8fr_1.1fr_90px] bg-slate-50 border-b border-slate-200 px-4 py-3.5 text-[10px] font-extrabold text-[#64748b] uppercase tracking-wider font-sans items-center">
+                  <div className="flex items-center justify-center">
+                    <input
+                      type="checkbox"
+                      checked={orderListFiltered.length > 0 && orderListFiltered.every(p => selectedPedidoIds.includes(p.id))}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          const pageIds = orderListFiltered.map(p => p.id);
+                          setSelectedPedidoIds(prev => Array.from(new Set([...prev, ...pageIds])));
+                        } else {
+                          const pageIds = orderListFiltered.map(p => p.id);
+                          setSelectedPedidoIds(prev => prev.filter(id => !pageIds.includes(id)));
+                        }
+                      }}
+                      className="w-4 h-4 rounded border-slate-300 text-brand focus:ring-brand accent-brand cursor-pointer"
+                    />
+                  </div>
                   <div>Cliente</div>
                   <div>Cidade</div>
                   <div>Produto & Cor</div>
@@ -3859,8 +4144,24 @@ export default function App() {
                         key={pedido.id}
                         id={`row-${pedido.id}`}
                         onClick={() => handleSelectAndHighlightPedido(pedido)}
-                        className={`grid grid-cols-[1.3fr_0.8fr_1.3fr_0.8fr_1.1fr_90px] px-4 py-3 text-xs items-center transition cursor-pointer select-none border-b border-slate-100 ${getRowBgClass(pedido.status, pedido.id)}`}
+                        className={`grid grid-cols-[40px_1.3fr_0.8fr_1.3fr_0.8fr_1.1fr_90px] px-4 py-3 text-xs items-center transition cursor-pointer select-none border-b border-slate-100 ${getRowBgClass(pedido.status, pedido.id)}`}
                       >
+                        {/* Checkbox Column */}
+                        <div className="flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={selectedPedidoIds.includes(pedido.id)}
+                            onChange={(e) => {
+                              setSelectedPedidoIds(curr => 
+                                e.target.checked 
+                                  ? [...curr, pedido.id] 
+                                  : curr.filter(id => id !== pedido.id)
+                              );
+                            }}
+                            className="w-4 h-4 rounded border-slate-300 text-brand focus:ring-brand accent-brand cursor-pointer"
+                          />
+                        </div>
+
                         {/* Cliente Column */}
                         <div className="flex flex-col gap-0.5 min-w-0 pr-2">
                           <span className="font-semibold text-slate-900 truncate">{pedido.nomeCompleto}</span>
@@ -3976,10 +4277,24 @@ export default function App() {
                     } ${getRowBgClass(pedido.status, pedido.id)}`}
                   >
                     {/* Card Header: Nº Venda & Data */}
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] bg-slate-100 border border-slate-200 text-slate-700 px-2 py-0.5 rounded-lg font-mono font-bold">
-                        Pedido #{pedido.numeroVenda}
-                      </span>
+                    <div className="flex items-center justify-between" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={selectedPedidoIds.includes(pedido.id)}
+                          onChange={(e) => {
+                            setSelectedPedidoIds(curr => 
+                              e.target.checked 
+                                ? [...curr, pedido.id] 
+                                : curr.filter(id => id !== pedido.id)
+                            );
+                          }}
+                          className="w-4 h-4 rounded border-slate-300 text-brand focus:ring-brand accent-brand cursor-pointer"
+                        />
+                        <span className="text-[10px] bg-slate-100 border border-slate-200 text-slate-700 px-2 py-0.5 rounded-lg font-mono font-bold">
+                          Pedido #{pedido.numeroVenda}
+                        </span>
+                      </div>
                       <span className="text-[10px] font-mono text-slate-500 font-bold flex items-center gap-1">
                         <Calendar className="w-3.5 h-3.5 text-slate-450" />
                         {pedido.data}
@@ -4316,7 +4631,23 @@ export default function App() {
               <div className="overflow-x-auto">
                 <table className="w-full text-xs text-left border-collapse min-w-[900px]">
                   <thead>
-                    <tr className="bg-slate-50 text-slate-500 text-[10px] uppercase font-extrabold tracking-wider border-b border-slate-200/90">
+                    <tr className="bg-slate-50 text-slate-500 text-[10px] uppercase font-extrabold tracking-wider border-b border-slate-200/90 animate-none">
+                      <th className="px-3 py-3.5 w-10 text-center">
+                        <input
+                          type="checkbox"
+                          checked={currentSupplierPedidos.length > 0 && currentSupplierPedidos.every(p => selectedPedidoIds.includes(p.id))}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              const pageIds = currentSupplierPedidos.map(p => p.id);
+                              setSelectedPedidoIds(prev => Array.from(new Set([...prev, ...pageIds])));
+                            } else {
+                              const pageIds = currentSupplierPedidos.map(p => p.id);
+                              setSelectedPedidoIds(prev => prev.filter(id => !pageIds.includes(id)));
+                            }
+                          }}
+                          className="w-4 h-4 rounded border-slate-300 text-brand focus:ring-brand accent-brand cursor-pointer"
+                        />
+                      </th>
                       <th className="px-3 py-3.5 w-28">Nº Venda</th>
                       <th className="px-3 py-3.5 w-24">Data</th>
                       <th className="px-3 py-3.5 w-48">Cliente</th>
@@ -4334,6 +4665,22 @@ export default function App() {
                     {currentSupplierPedidos.length > 0 ? (
                       currentSupplierPedidos.map((p) => (
                         <tr key={p.id} className="hover:bg-slate-50/50 transition">
+                          {/* Selector Checkbox */}
+                          <td className="px-2 py-2 text-center" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={selectedPedidoIds.includes(p.id)}
+                              onChange={(e) => {
+                                setSelectedPedidoIds(curr => 
+                                  e.target.checked 
+                                    ? [...curr, p.id] 
+                                    : curr.filter(id => id !== p.id)
+                                );
+                              }}
+                              className="w-4 h-4 rounded border-slate-300 text-brand focus:ring-brand accent-brand cursor-pointer"
+                            />
+                          </td>
+
                           {/* Numero */}
                           <td className="px-2 py-2">
                             <input 
@@ -4493,7 +4840,7 @@ export default function App() {
                       ))
                     ) : (
                       <tr>
-                        <td colSpan={isAdminMode ? 10 : 9} className="py-12 text-center text-slate-400">
+                        <td colSpan={isAdminMode ? 11 : 10} className="py-12 text-center text-slate-400">
                           Nenhuma venda cadastrada.
                         </td>
                       </tr>
@@ -4513,6 +4860,47 @@ export default function App() {
       <footer className="mt-auto py-6 text-center border-t border-natural-border bg-[#FDFCFB]">
         <p className="text-xs text-natural-muted font-medium font-sans">IA Zap Registro • Sistema Inteligente para Fábrica e Vendas Diretas</p>
       </footer>
+
+      {/* Floating Bulk Actions Bar */}
+      {selectedPedidoIds.length > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 border border-slate-800 text-white px-5 py-4 rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 z-40 max-w-[95vw] md:max-w-xl w-full animate-fade-in font-sans">
+          <div className="flex items-center gap-2">
+            <span className="bg-brand text-xs font-black px-2.5 py-1 rounded-lg shrink-0">
+              {selectedPedidoIds.length}
+            </span>
+            <span className="text-xs font-bold text-slate-350 leading-none shrink-0">
+              {selectedPedidoIds.length === 1 ? 'pedido selecionado' : 'pedidos selecionados'}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:ml-auto">
+            <button
+              onClick={handleBulkMarkAsDelivered}
+              className="flex-1 md:flex-none bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-black py-2 px-3 rounded-xl transition cursor-pointer select-none shadow-3xs"
+            >
+              Marcar Entregue ✅
+            </button>
+            <button
+              onClick={() => handleBulkUpdateStatus('PENDING')}
+              className="flex-1 md:flex-none bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold py-2 px-3 rounded-xl transition cursor-pointer select-none shadow-3xs border border-slate-700"
+            >
+              Pendente ⏳
+            </button>
+            <button
+              onClick={handleBulkCancel}
+              className="flex-1 md:flex-none bg-slate-800 hover:bg-slate-750 text-rose-500 text-[11px] font-bold py-2 px-3 rounded-xl transition cursor-pointer select-none shadow-3xs border border-slate-700"
+            >
+              Cancelar ❌
+            </button>
+            <button
+              onClick={() => setSelectedPedidoIds([])}
+              className="text-slate-400 hover:text-white text-xs px-2.5 font-medium cursor-pointer"
+            >
+              Desmarcar
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* DETAIL VIEW MODAL DIALOG */}
       <AnimatePresence>
@@ -5835,10 +6223,15 @@ export default function App() {
                       <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-2xs space-y-4 max-w-lg">
                         <div className="space-y-4">
                           {[0, 1, 2, 3].map((idx) => (
-                            <div key={idx} className="space-y-1.5">
-                              <label className="text-[9.5px] font-bold text-slate-500 uppercase tracking-widest block">
-                                Chave de API Gemini {idx + 1}
-                              </label>
+                            <div key={idx} className="space-y-1.5 font-sans">
+                              <div className="flex items-center justify-between">
+                                <label className="text-[9.5px] font-bold text-slate-500 uppercase tracking-widest block">
+                                  Chave de API Gemini {idx + 1}
+                                </label>
+                                {keyStatuses[idx] === 'testing' && <span className="text-[10px] font-bold text-blue-500 animate-pulse">⏳ Testando...</span>}
+                                {keyStatuses[idx] === 'success' && <span className="text-[10px] font-bold text-emerald-600">✅ Funcionando</span>}
+                                {keyStatuses[idx] === 'failed' && <span className="text-[10px] font-bold text-rose-500">❌ Falhou</span>}
+                              </div>
                               <input
                                 type="password"
                                 placeholder={`Insira a chave de API ${idx + 1} (ex: AIzaSy...)`}
@@ -5854,29 +6247,22 @@ export default function App() {
                           ))}
                         </div>
 
-                        <button
-                          onClick={() => {
-                            // Validar formato básico das chaves do Gemini (AIzaSy..., 39 caracteres)
-                            const invalidFormatKeys: number[] = [];
-                            aiKeys.forEach((k, idx) => {
-                              const trimmed = k ? k.trim() : "";
-                              if (trimmed && (!trimmed.startsWith("AIzaSy") || trimmed.length < 35)) {
-                                invalidFormatKeys.push(idx + 1);
-                              }
-                            });
-
-                            localStorage.setItem('iazap_gemini_keys', JSON.stringify(aiKeys));
-
-                            if (invalidFormatKeys.length > 0) {
-                              triggerToast('info', `Chaves salvas! Nota: A(s) Chave(s) ${invalidFormatKeys.join(', ')} não parece(m) estar no formato padrão do Gemini (deve começar com AIzaSy... e ter cerca de 39 caracteres). Certifique-se de copiar a chave inteira.`);
-                            } else {
-                              triggerToast('success', 'Chaves de API salvas localmente com sucesso!');
-                            }
-                          }}
-                          className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center gap-1.5 cursor-pointer transition shadow-2xs"
-                        >
-                          Salvar Chaves
-                        </button>
+                        <div className="flex flex-wrap items-center gap-3">
+                          <button
+                            id="btn-save-keys"
+                            onClick={handleSaveAndValidateKeys}
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center gap-1.5 cursor-pointer transition shadow-2xs"
+                          >
+                            Salvar Chaves
+                          </button>
+                          <button
+                            id="btn-test-keys"
+                            onClick={handleTestKeys}
+                            className="bg-slate-700 hover:bg-slate-800 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center gap-1.5 cursor-pointer transition shadow-2xs"
+                          >
+                            Testar Chaves
+                          </button>
+                        </div>
 
                         <div className="text-[10px] text-slate-500 font-medium bg-slate-50 p-3.5 rounded-xl border border-slate-200/60 leading-relaxed font-sans">
                           💡 <strong>Fila de Fallback automático:</strong> O sistema tentará usar a Chave 1. Se ela falhar (erro 500, 503, timeout de 30s, etc.), tentará a Chave 2 automaticamente, e assim por diante. Se você não cadastrar nenhuma chave, o sistema utilizará o limite padrão global do servidor.
