@@ -212,7 +212,7 @@ export default function App() {
   const [isRestoring, setIsRestoring] = useState<boolean>(false);
   const [isExecutingUpdate, setIsExecutingUpdate] = useState<boolean>(false);
   const [updateStep, setUpdateStep] = useState<number>(0); 
-  const [activeSettingsTab, setActiveSettingsTab] = useState<'backup' | 'logs' | 'ailogs' | 'diagnostico' | 'operator' | 'keys'>('backup');
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'backup' | 'logs' | 'ailogs' | 'diagnostico' | 'operator'>('backup');
 
   const handleCopyText = (text: string, fieldId: string) => {
     navigator.clipboard.writeText(text);
@@ -342,28 +342,6 @@ export default function App() {
     } catch {
       return [];
     }
-  });
-
-  const [aiKeys, setAiKeys] = useState<string[]>(() => {
-    try {
-      const stored = localStorage.getItem('iazap_gemini_keys');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length === 4) {
-          return parsed;
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return ['', '', '', ''];
-  });
-
-  const [keyStatuses, setKeyStatuses] = useState<Record<number, 'none' | 'testing' | 'success' | 'failed'>>({
-    0: 'none',
-    1: 'none',
-    2: 'none',
-    3: 'none'
   });
 
   const [selectedPedidoIds, setSelectedPedidoIds] = useState<string[]>([]);
@@ -1309,13 +1287,13 @@ export default function App() {
     }
   };
 
-  // 1. CADASTRO INTELIGENTE DE PEDIDOS COM IA (WA Paste Interpreter)
+  // 1. CADASTRO INTELIGENTE DE PEDIDOS (Preenchimento Automático Local)
   const handleParseWhatsAppOrder = async () => {
     if (!fornecedorSelecionado) {
       triggerToast('error', 'Selecione o fornecedor.');
       return;
     }
-    console.log('Iniciando análise');
+    console.log('Iniciando preenchimento automático local');
     console.log('Fornecedor selecionado:', fornecedorSelecionado);
     if (!pasteOrderText.trim()) {
       triggerToast('error', 'Por favor, cole um texto de pedido do WhatsApp.');
@@ -1327,424 +1305,72 @@ export default function App() {
     const analysisStartTime = Date.now();
     const textLen = pasteOrderText.length;
 
-    // ETAPA 1 - PARSER LOCAL (PRIORIDADE MÁXIMA)
+    // PARSER LOCAL
     const localParsed = parseWhatsAppOrderWithRegex(pasteOrderText);
     
-    if (isRapidAnalysis) {
-      const durationMs = Date.now() - analysisStartTime;
-      
-      const newLog: AiAnalysisLog = {
-        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
-        timestamp: new Date().toISOString(),
-        durationMs,
-        textLength: textLen,
-        inputText: pasteOrderText,
-        response: JSON.stringify(localParsed, null, 2),
-        isRapid: true,
-        supplier: currentSupplier,
-        modelUsed: "PARSER LOCAL (Modo Rápido)",
-        errorCode: "SUCCESS"
-      };
-
-      setAiLogs(prev => [newLog, ...prev].slice(0, 50));
-      localStorage.setItem('iazap_ai_logs', JSON.stringify([newLog, ...aiLogs].slice(0, 50)));
-
-      setAiDiagnostics(prev => ({
-        ...prev,
-        totalAnalises: prev.totalAnalises + 1,
-        resolvidaSemIa: prev.resolvidaSemIa + 1,
-        sucesso: prev.sucesso + 1
-      }));
-
-      const today = new Date();
-      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
-
-      const totalVal = Number(localParsed.valorTotal) || 0;
-      let finalComis: number | undefined = undefined;
-      if (fornecedorSelecionado === 'Sofia Home Decor') {
-        finalComis = Number((totalVal * 0.1).toFixed(2));
-      } else {
-        finalComis = undefined;
-      }
-
-      setEditingPedido({
-        numeroVenda: nextNum,
-        data: formattedDate,
-        nomeCompleto: localParsed.nomeCompleto || '',
-        telefone1: localParsed.telefone1 || '',
-        telefone2: localParsed.telefone2 || '',
-        endereco: localParsed.endereco || '',
-        city: localParsed.city || 'NÃO INFORMADO',
-        state: localParsed.state || '',
-        produto: localParsed.produto || '',
-        cor: localParsed.cor || '',
-        quantidade: Number(localParsed.quantidade) || 1,
-        formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
-        valorTotal: totalVal,
-        comissao: finalComis,
-        status: 'PENDING',
-        textoOriginal: pasteOrderText,
-        observacoes: localParsed.observacoes || 'Extraído via Modo Análise Rápida local',
-        supplier: getSupplierKeyByName(fornecedorSelecionado)
-      });
-
-      triggerToast('success', 'Ficha processada em Modo Rápido com sucesso! (Sem uso de IA)');
-      setIsProcessingOrder(false);
-      return;
-    }
-
-    // Funções de validação solicitadas (Validação)
-    const isValidPhone = (str: string) => {
-      if (!str) return false;
-      const digitsOnly = str.replace(/\D/g, '');
-      return digitsOnly.length >= 8;
-    };
-
-    const isValidValue = (val: number) => {
-      return typeof val === 'number' && !isNaN(val) && val > 0;
-    };
-
-    const isValidCity = (str: string) => {
-      return str && str.trim().length > 0 && str !== 'NÃO INFORMADO';
-    };
-
-    const isValidProduct = (str: string) => {
-      return str && str.trim().length > 0 && str !== 'Produto não identificado';
-    };
-
-    // Validar regras requisitadas
-    const isPhoneValid = isValidPhone(localParsed.telefone1);
-    const isValueValid = isValidValue(localParsed.valorTotal);
-    const isCityValid = isValidCity(localParsed.city);
-    const isProductValid = isValidProduct(localParsed.produto);
-
-    // Calcular correspondência de campos preenchidos p/ avaliar >= 80% do preenchimento
-    let foundFieldsCount = 0;
-    if (localParsed.nomeCompleto && localParsed.nomeCompleto.trim().length > 2) foundFieldsCount++;
-    if (isPhoneValid) foundFieldsCount++;
-    if (isCityValid) foundFieldsCount++;
-    if (isProductValid) foundFieldsCount++;
-    if (isValueValid) foundFieldsCount++;
-    if (localParsed.endereco && localParsed.endereco.trim().length > 3 || localParsed.city === 'RETIRADA') foundFieldsCount++;
-    if (localParsed.formaPagamento && localParsed.formaPagamento !== 'A combinar' && localParsed.formaPagamento !== 'NÃO INFORMADO') foundFieldsCount++;
-    if (localParsed.comissaoSugerida > 0 || (localParsed.valorTotal > 0 && comissaoPercent > 0)) foundFieldsCount++;
-
-    // REGRA DE CONFIANÇA: Se o parser preencher mais de 80% dos campos fundamentais E passar nas validações cruciais:
-    // Não chamar Gemini. Salvar resultado.
-    const isHighConfidence = foundFieldsCount >= 6 && isPhoneValid && isValueValid && isCityValid && isProductValid;
-
-    if (isHighConfidence) {
-      const durationMs = Date.now() - analysisStartTime;
-      
-      // Registrar log com indicação conceitual de parser local
-      const newLog: AiAnalysisLog = {
-        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
-        timestamp: new Date().toISOString(),
-        durationMs,
-        textLength: textLen,
-        inputText: pasteOrderText,
-        response: JSON.stringify(localParsed, null, 2),
-        isRapid: true,
-        supplier: currentSupplier,
-        modelUsed: `PARSER LOCAL (${localParsed.modelUsed || "Sem IA"})`,
-        errorCode: "SUCCESS"
-      };
-
-      setAiLogs(prev => [newLog, ...prev].slice(0, 50));
-
-      // Incrementar os diagnósticos de consumo local sem custos de créditos de IA
-      setAiDiagnostics(prev => ({
-        ...prev,
-        totalAnalises: prev.totalAnalises + 1,
-        resolvidaSemIa: prev.resolvidaSemIa + 1,
-        sucesso: prev.sucesso + 1
-      }));
-
-      // Preencher o formulário
-      const today = new Date();
-      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
-
-      const totalVal = Number(localParsed.valorTotal) || 0;
-      let finalComis: number | undefined = undefined;
-      if (fornecedorSelecionado === 'Sofia Home Decor') {
-        finalComis = Number((totalVal * 0.1).toFixed(2));
-      } else {
-        finalComis = undefined;
-      }
-
-      setEditingPedido({
-        numeroVenda: nextNum,
-        data: formattedDate,
-        nomeCompleto: localParsed.nomeCompleto || '',
-        telefone1: localParsed.telefone1 || '',
-        telefone2: localParsed.telefone2 || '',
-        endereco: localParsed.endereco || '',
-        city: localParsed.city || 'NÃO INFORMADO',
-        state: localParsed.state || '',
-        produto: localParsed.produto || '',
-        cor: localParsed.cor || '',
-        quantidade: Number(localParsed.quantidade) || 1,
-        formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
-        valorTotal: totalVal,
-        comissao: finalComis,
-        status: 'PENDING',
-        textoOriginal: pasteOrderText,
-        observacoes: localParsed.observacoes || 'Extraído via Parser Local Inteligente',
-        supplier: getSupplierKeyByName(fornecedorSelecionado)
-      });
-
-      triggerToast('success', 'Ficha processada localmente com sucesso! (Economizado crédito de IA)');
-      setIsProcessingOrder(false);
-      return;
-    }
-
-    // ETAPA 2 - GEMINI COM FILA DE FALLBACK DE CHAVES
-    let savedKeys: string[] = [];
-    try {
-      const stored = localStorage.getItem('iazap_gemini_keys');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          savedKeys = parsed.filter((k: any) => typeof k === 'string' && k.trim().length > 0);
-        }
-      }
-    } catch (e) {
-      console.error(e);
-    }
-
-    const candidates = savedKeys.length > 0 ? savedKeys : [""];
-    
-    let isSuccessful = false;
-    let extracted: any = null;
-    let lastError: any = null;
-    let errorCodeValue = "";
-    let finalKeyUsedMasked = "Chave Padrão Servidor";
-    
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-    // Tentamos usar cada chave da fila em sequência
-    for (let kIdx = 0; kIdx < candidates.length; kIdx++) {
-      const keyArg = candidates[kIdx];
-      const maskedKey = keyArg 
-        ? `${keyArg.substring(0, 6)}...${keyArg.substring(Math.max(0, keyArg.length - 4))}`
-        : "Chave Padrão Servidor";
-        
-      const keyLabel = `Chave ${kIdx + 1}/${candidates.length} (${maskedKey})`;
-      console.log(`[Diagnostic] Iniciando tentativa com ${keyLabel}`);
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        controller.abort();
-      }, 10000); // 10s timeout
-
-      try {
-        const response = await fetch("/api/gemini/parse-pedido", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
-            text: pasteOrderText, 
-            rapidMode: isRapidAnalysis,
-            apiKey: keyArg || undefined
-          }),
-          signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-          throw new Error(`Servidor retornou código ${response.status}`);
-        }
-
-        const resJson = await response.json();
-        if (resJson.success && resJson.data) {
-          extracted = resJson.data;
-          isSuccessful = true;
-          errorCodeValue = "SUCCESS";
-          finalKeyUsedMasked = maskedKey;
-          break; // Sai da lista de fallback em caso de sucesso!
-        } else {
-          throw new Error(resJson.error || "IA não conseguiu interpretar os campos estruturados.");
-        }
-      } catch (error: any) {
-        clearTimeout(timeoutId);
-        lastError = error;
-        const isTimeout = error.name === 'AbortError';
-        errorCodeValue = isTimeout ? 'TIMEOUT_10S' : (error.message || '500_OR_503_ERROR');
-        
-        console.error(`[Diagnostic Error] Tentativa com ${keyLabel} falhou com código ${errorCodeValue}.`);
-        
-        // Registrar log de erro específico desta chave falha
-        const logDuration = Date.now() - analysisStartTime;
-        const failLog: AiAnalysisLog = {
-          id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
-          timestamp: new Date().toISOString(),
-          durationMs: logDuration,
-          textLength: textLen,
-          inputText: pasteOrderText,
-          error: `Falha na Chave ${kIdx + 1} (${errorCodeValue}): ${error.message || error}`,
-          isRapid: isRapidAnalysis,
-          supplier: currentSupplier,
-          modelUsed: "gemini-3.5-flash",
-          errorCode: errorCodeValue,
-          geminiKeyUsed: maskedKey
-        };
-        
-        setAiLogs(prev => {
-          const updatedLogs = [failLog, ...prev].slice(0, 50);
-          localStorage.setItem('iazap_ai_logs', JSON.stringify(updatedLogs));
-          return updatedLogs;
-        });
-
-        if (kIdx < candidates.length - 1) {
-          triggerToast('info', `Chave ${kIdx + 1} falhou. Alternando automaticamente para Chave ${kIdx + 2}...`);
-        }
-      }
-    }
-
     const durationMs = Date.now() - analysisStartTime;
+    
+    const newLog: AiAnalysisLog = {
+      id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
+      timestamp: new Date().toISOString(),
+      durationMs,
+      textLength: textLen,
+      inputText: pasteOrderText,
+      response: JSON.stringify(localParsed, null, 2),
+      isRapid: true,
+      supplier: currentSupplier,
+      modelUsed: "PARSER LOCAL (Sem IA)",
+      errorCode: "SUCCESS"
+    };
 
-    if (isSuccessful && extracted) {
-      // Registrar log bem sucedido
-      const newLog: AiAnalysisLog = {
-        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
-        timestamp: new Date().toISOString(),
-        durationMs,
-        textLength: textLen,
-        inputText: pasteOrderText,
-        response: JSON.stringify(extracted, null, 2),
-        isRapid: isRapidAnalysis,
-        supplier: currentSupplier,
-        modelUsed: "gemini-3.5-flash",
-        errorCode: "SUCCESS",
-        geminiKeyUsed: finalKeyUsedMasked
-      };
-      
-      setAiLogs(prev => {
-        const updatedLogs = [newLog, ...prev].slice(0, 50);
-        localStorage.setItem('iazap_ai_logs', JSON.stringify(updatedLogs));
-        return updatedLogs;
-      });
+    setAiLogs(prev => [newLog, ...prev].slice(0, 50));
+    localStorage.setItem('iazap_ai_logs', JSON.stringify([newLog].concat(aiLogs).slice(0, 50)));
 
-      // Atualizar Controle de Consumo
-      setAiDiagnostics(prev => ({
-        ...prev,
-        totalAnalises: prev.totalAnalises + 1,
-        enviadaGemini: prev.enviadaGemini + 1,
-        sucesso: prev.sucesso + 1
-      }));
+    setAiDiagnostics(prev => ({
+      ...prev,
+      totalAnalises: prev.totalAnalises + 1,
+      resolvidaSemIa: prev.resolvidaSemIa + 1,
+      sucesso: prev.sucesso + 1
+    }));
 
-      // Preencher dados estruturados
-      const today = new Date();
-      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
+    const today = new Date();
+    const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
+    const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
 
-      const totalVal = Number(extracted.valorTotal) || 0;
-      let finalComis: number | undefined = undefined;
-      if (fornecedorSelecionado === 'Sofia Home Decor') {
-        finalComis = Number((totalVal * 0.1).toFixed(2));
-      } else {
-        finalComis = undefined;
-      }
-
-      setEditingPedido({
-        numeroVenda: nextNum,
-        data: formattedDate,
-        nomeCompleto: extracted.nomeCompleto || '',
-        telefone1: extracted.telefone1 || '',
-        telefone2: extracted.telefone2 || '',
-        endereco: extracted.endereco || '',
-        city: extracted.city || 'NÃO INFORMADO',
-        state: extracted.state || '',
-        produto: extracted.produto || '',
-        cor: extracted.cor || '',
-        quantidade: Number(extracted.quantidade) || 1,
-        formaPagamento: normalizeFormaPagamento(extracted.formaPagamento),
-        valorTotal: totalVal,
-        comissao: finalComis,
-        status: 'PENDING',
-        textoOriginal: pasteOrderText,
-        observacoes: extracted.observacoes || '',
-        supplier: getSupplierKeyByName(fornecedorSelecionado)
-      });
-
-      triggerToast('success', 'Ficha interpretada pela IA com sucesso! Verifique os dados abaixo.');
+    const totalVal = Number(localParsed.valorTotal) || 0;
+    let finalComis: number | undefined = undefined;
+    if (fornecedorSelecionado === 'Sofia Home Decor') {
+      finalComis = Number((totalVal * 0.1).toFixed(2));
     } else {
-      // ETAPA 4 - FALLBACK (Análise pelo parser local de emergência, aberto em cadastro manual)
-      const errorMsg = lastError?.name === 'AbortError' 
-        ? 'Análise cancelada devido ao tempo limite de 10 segundos excedido do Gemini.' 
-        : (lastError?.message || 'IA temporariamente indisponível.');
-
-      const newLog: AiAnalysisLog = {
-        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(7),
-        timestamp: new Date().toISOString(),
-        durationMs,
-        textLength: textLen,
-        inputText: pasteOrderText,
-        error: errorMsg,
-        isRapid: isRapidAnalysis,
-        supplier: currentSupplier,
-        modelUsed: "gemini-3.5-flash",
-        errorCode: errorCodeValue,
-        geminiKeyUsed: "Nenhuma (Todas as chaves falharam)"
-      };
-      
-      setAiLogs(prev => {
-        const updatedLogs = [newLog, ...prev].slice(0, 50);
-        localStorage.setItem('iazap_ai_logs', JSON.stringify(updatedLogs));
-        return updatedLogs;
-      });
-
-      // Atualizar estatísticas de consumo com indicação de erro na IA
-      setAiDiagnostics(prev => ({
-        ...prev,
-        totalAnalises: prev.totalAnalises + 1,
-        enviadaGemini: prev.enviadaGemini + 1,
-        erros: prev.erros + 1
-      }));
-
-      const today = new Date();
-      const formattedDate = `${String(today.getDate()).padStart(2, '0')}/${String(today.getMonth() + 1).padStart(2, '0')}`;
-      const nextNum = generateNextNumeroVenda(currentSupplierPedidos);
-
-      const totalVal = Number(localParsed.valorTotal) || 0;
-      let finalComis: number | undefined = undefined;
-      if (fornecedorSelecionado === 'Sofia Home Decor') {
-        finalComis = Number((totalVal * 0.1).toFixed(2));
-      } else {
-        finalComis = undefined;
-      }
-
-      setEditingPedido({
-        numeroVenda: nextNum,
-        data: formattedDate,
-        nomeCompleto: localParsed.nomeCompleto || '',
-        telefone1: localParsed.telefone1 || '',
-        telefone2: localParsed.telefone2 || '',
-        endereco: localParsed.endereco || '',
-        city: localParsed.city || 'NÃO INFORMADO',
-        state: localParsed.state || '',
-        produto: localParsed.produto || 'Produto não identificado',
-        cor: localParsed.cor || '',
-        quantidade: Number(localParsed.quantidade) || 1,
-        formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
-        valorTotal: totalVal,
-        comissao: finalComis,
-        status: 'PENDING',
-        textoOriginal: pasteOrderText, // Nunca esvazia e nunca perde o texto original
-        observacoes: localParsed.observacoes || 'Extraído via Fallback de Emergência',
-        supplier: getSupplierKeyByName(fornecedorSelecionado)
-      });
-
-      setAiAnalysisError("IA temporariamente indisponível. Você pode continuar utilizando o cadastro manual.");
-      triggerToast('info', 'Ficha preenchida via Fallback de Emergência (cadastro manual aberto).');
+      finalComis = undefined;
     }
 
+    setEditingPedido({
+      numeroVenda: nextNum,
+      data: formattedDate,
+      nomeCompleto: localParsed.nomeCompleto || '',
+      telefone1: localParsed.telefone1 || '',
+      telefone2: localParsed.telefone2 || '',
+      endereco: localParsed.endereco || '',
+      city: localParsed.city || 'NÃO INFORMADO',
+      state: localParsed.state || '',
+      produto: localParsed.produto || '',
+      cor: localParsed.cor || '',
+      quantidade: Number(localParsed.quantidade) || 1,
+      formaPagamento: normalizeFormaPagamento(localParsed.formaPagamento),
+      valorTotal: totalVal,
+      comissao: finalComis,
+      status: 'PENDING',
+      textoOriginal: pasteOrderText,
+      observacoes: localParsed.observacoes || 'Preenchido via Preenchimento Automático',
+      supplier: getSupplierKeyByName(fornecedorSelecionado)
+    });
+
+    triggerToast('success', 'Ficha preenchida automaticamente com sucesso! (100% Local, Sem IA)');
     setIsProcessingOrder(false);
   };
 
-  // 6. CAMPO “PEDIDO ENTREGUE” COM IA
+  // 6. CAMPO “PEDIDO ENTREGUE” (Busca Rápida Local)
   const handleParseDeliveryUpdate = async () => {
     if (!pasteDeliveryText.trim()) {
       triggerToast('error', 'Digite ou cole uma mensagem de entrega (ex: "João Silva entregue").');
@@ -1753,92 +1379,52 @@ export default function App() {
 
     setIsProcessingDelivery(true);
     try {
-      // Filter active orders to optimize context payload and costs
-      const activeOrders = pedidos
-        .filter(p => p.status !== 'DELIVERED')
-        .map(p => ({
-          id: p.id,
-          nomeCompleto: p.nomeCompleto,
-          produto: p.produto,
-          cor: p.cor
-        }));
-
+      // Find active orders
+      const activeOrders = pedidos.filter(p => p.status !== 'DELIVERED');
       if (activeOrders.length === 0) {
         triggerToast('info', 'Não há pedidos pendentes ou agendados ativos para corresponder à entrega.');
         setIsProcessingDelivery(false);
         return;
       }
 
-      // Encontrar chaves salvas localmente
-      let savedKeys: string[] = [];
-      try {
-        const stored = localStorage.getItem('iazap_gemini_keys');
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (Array.isArray(parsed)) {
-            savedKeys = parsed.filter((k: any) => typeof k === 'string' && k.trim().length > 0);
-          }
-        }
-      } catch (e) {
-        console.error(e);
-      }
-
-      const candidates = savedKeys.length > 0 ? savedKeys : [""];
+      const normText = pasteDeliveryText.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
       
-      let isSuccessful = false;
-      let resJson: any = null;
+      let bestMatch: Pedido | null = null;
+      let maxMatchScore = 0;
 
-      for (let kIdx = 0; kIdx < candidates.length; kIdx++) {
-        const keyArg = candidates[kIdx];
-        const maskedKey = keyArg 
-          ? `${keyArg.substring(0, 6)}...${keyArg.substring(Math.max(0, keyArg.length - 4))}`
-          : "Chave Padrão Servidor";
-
-        try {
-          const response = await fetch("/api/gemini/parse-entregue", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              text: pasteDeliveryText, 
-              activeOrders,
-              apiKey: keyArg || undefined
-            })
-          });
-
-          if (!response.ok) {
-            throw new Error(`Erro do servidor: ${response.status}`);
+      for (const p of activeOrders) {
+        if (!p.nomeCompleto) continue;
+        const normName = p.nomeCompleto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        const nameParts = normName.split(/\s+/).filter(w => w.length > 2); // only consider words > 2 chars
+        
+        let matchedParts = 0;
+        for (const part of nameParts) {
+          if (normText.includes(part)) {
+            matchedParts++;
           }
-
-          resJson = await response.json();
-          isSuccessful = true;
-          break; // Sucesso, sai da fila!
-        } catch (err: any) {
-          console.error(`Falha ao processar com a chave ${maskedKey}:`, err);
-          if (kIdx < candidates.length - 1) {
-            triggerToast('info', `Chave ${kIdx + 1} falhou. Alternando automaticamente para Chave ${kIdx + 2}...`);
-          } else {
-            throw new Error(err.message || 'Todas as chaves de API falharam.');
+        }
+        
+        if (matchedParts > 0) {
+          // Score is ratio of matched parts + bonus
+          const score = matchedParts / nameParts.length;
+          if (score > maxMatchScore) {
+            maxMatchScore = score;
+            bestMatch = p;
           }
         }
       }
 
-      if (isSuccessful && resJson && resJson.success && resJson.matchedOrderId) {
-        const matchedId = resJson.matchedOrderId;
-        const index = pedidos.find(p => p.id === matchedId);
-        
-        if (index) {
-          await updatePedidoStatus(matchedId, 'DELIVERED', undefined, currentUser?.name || currentUser?.username || 'Sistema', index.supplier);
-          triggerToast('success', `Confirmado! Pedido ${index.numeroVenda} (${index.nomeCompleto}) marcado como Entregue via IA.`);
-          setPasteDeliveryText('');
-        } else {
-          triggerToast('error', 'Pedido correspondido não foi localizado localmente no banco de dados.');
-        }
+      // If matching score is decent (e.g., at least matches 40% of the name or at least 1 complete word)
+      if (bestMatch && maxMatchScore >= 0.3) {
+        await updatePedidoStatus(bestMatch.id, 'DELIVERED', undefined, currentUser?.name || currentUser?.username || 'Sistema', bestMatch.supplier);
+        triggerToast('success', `Confirmado! Pedido ${bestMatch.numeroVenda} (${bestMatch.nomeCompleto}) marcado como Entregue via busca local.`);
+        setPasteDeliveryText('');
       } else {
-        triggerToast('refused', 'A IA não conseguiu associar esta confirmação a nenhum pedido pendente/agendado ativo.');
+        triggerToast('refused', 'Não foi possível associar esta confirmação a nenhum de seus pedidos ativos (nenhum nome correspondente encontrado).');
       }
     } catch (error: any) {
       console.error(error);
-      triggerToast('error', `Falha ao processar entrega com IA: ${error.message || 'Verifique a conexão.'}`);
+      triggerToast('error', `Falha ao processar entrega: ${error.message || 'Verifique o formato.'}`);
     } finally {
       setIsProcessingDelivery(false);
     }
@@ -1931,116 +1517,7 @@ export default function App() {
     }
   };
 
-  const handleTestKeys = async () => {
-    let hasKeys = false;
-    const nextStatuses = { ...keyStatuses };
-    
-    // Set all state to testing or none
-    for (let idx = 0; idx < 4; idx++) {
-      const trimmed = aiKeys[idx] ? aiKeys[idx].trim() : "";
-      if (trimmed) {
-        nextStatuses[idx] = 'testing';
-        hasKeys = true;
-      } else {
-        nextStatuses[idx] = 'none';
-      }
-    }
-    
-    setKeyStatuses(nextStatuses);
 
-    if (!hasKeys) {
-      triggerToast('info', 'Por favor, insira pelo menos uma chave de API para testar.');
-      return;
-    }
-
-    triggerToast('info', 'Iniciando teste das chaves de API com o servidor...');
-
-    // Test each asynchronously / concurrently
-    await Promise.all(
-      [0, 1, 2, 3].map(async (idx) => {
-        const key = aiKeys[idx] ? aiKeys[idx].trim() : "";
-        if (!key) return;
-
-        try {
-          const res = await fetch("/api/gemini/validate-key", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ apiKey: key }),
-          });
-          const resJson = await res.json();
-          if (res.ok && resJson.success) {
-            setKeyStatuses(prev => ({ ...prev, [idx]: 'success' }));
-          } else {
-            setKeyStatuses(prev => ({ ...prev, [idx]: 'failed' }));
-          }
-        } catch (err) {
-          setKeyStatuses(prev => ({ ...prev, [idx]: 'failed' }));
-        }
-      })
-    );
-
-    triggerToast('success', 'Teste de chaves finalizado!');
-  };
-
-  const handleSaveAndValidateKeys = async () => {
-    localStorage.setItem('iazap_gemini_keys', JSON.stringify(aiKeys));
-    
-    // Check if there are any non-empty keys
-    const filledKeys = aiKeys.map((k, idx) => ({ key: k ? k.trim() : "", index: idx })).filter(item => item.key !== "");
-    
-    if (filledKeys.length === 0) {
-      triggerToast('success', 'Chaves limpas e salvas localmente!');
-      setKeyStatuses({ 0: 'none', 1: 'none', 2: 'none', 3: 'none' });
-      return;
-    }
-
-    // Mark the filled keys as 'testing'
-    const nextStatuses = { ...keyStatuses };
-    filledKeys.forEach(item => {
-      nextStatuses[item.index] = 'testing';
-    });
-    setKeyStatuses(nextStatuses);
-
-    triggerToast('info', 'Chaves salvas localmente! Validando comunicação com a API do Gemini...');
-
-    let anySuccess = false;
-    let anyFail = false;
-
-    await Promise.all(
-      filledKeys.map(async (item) => {
-        try {
-          const res = await fetch("/api/gemini/validate-key", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ apiKey: item.key }),
-          });
-          const resJson = await res.json();
-          if (res.ok && resJson.success) {
-            setKeyStatuses(prev => ({ ...prev, [item.index]: 'success' }));
-            anySuccess = true;
-          } else {
-            setKeyStatuses(prev => ({ ...prev, [item.index]: 'failed' }));
-            anyFail = true;
-          }
-        } catch (err) {
-          setKeyStatuses(prev => ({ ...prev, [item.index]: 'failed' }));
-          anyFail = true;
-        }
-      })
-    );
-
-    if (anyFail && !anySuccess) {
-      triggerToast('error', 'Chave inválida ou sem permissão');
-    } else if (anySuccess) {
-      triggerToast('success', 'Chave validada com sucesso');
-    } else {
-      triggerToast('success', 'Chaves salvas com sucesso!');
-    }
-  };
 
   // Fast manually trigger status update without AI
   const handleQuickStatusUpdate = async (id: string, newStatus: any, extra?: { dataReagendamento?: string }) => {
@@ -2900,21 +2377,7 @@ export default function App() {
               <span>Backup e Segurança</span>
             </button>
 
-            {/* CHAVES DE API HEADER BUTTON (ENGRENAGEM) */}
-            <button
-              id="btn-header-gemini-keys"
-              onClick={() => {
-                setActiveSettingsTab('keys');
-                setShowSettingsModal(true);
-                setShowReportsModal(false);
-                setShowNotificationsDropdown(false);
-              }}
-              className="inline-flex items-center gap-1.5 bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700 text-xs py-2 px-3.5 rounded-full font-extrabold transition cursor-pointer"
-              title="Configurar Chaves da IA do Gemini"
-            >
-              <Settings className="w-3.5 h-3.5 text-emerald-500 animate-spin-slow" />
-              <span>Configurações IA</span>
-            </button>
+
 
             {/* Direct update button */}
             <button 
@@ -3045,23 +2508,11 @@ export default function App() {
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="font-sans font-extrabold text-lg text-slate-900 flex items-center gap-2">
                     <span>1. Colar Pedido do WhatsApp</span>
-                    <span className="text-[10px] uppercase font-extrabold tracking-wider bg-blue-50 text-blue-600 px-2.5 py-0.5 rounded-full border border-blue-100">Inteligente</span>
+                    <span className="text-[10px] uppercase font-extrabold tracking-wider bg-blue-50 text-blue-600 px-2.5 py-0.5 rounded-full border border-blue-100">Automático</span>
                   </h2>
-                  <button
-                    onClick={() => {
-                      setActiveSettingsTab('keys');
-                      setShowSettingsModal(true);
-                    }}
-                    type="button"
-                    className="p-1 px-2 hover:bg-rose-50 hover:text-rose-600 rounded-lg transition text-slate-400 cursor-pointer flex items-center gap-1 border border-slate-200/60 bg-slate-50/50"
-                    title="Configurar chaves de API Gemini (Engrenagem)"
-                  >
-                    <Settings className="w-3.5 h-3.5 text-emerald-500 animate-spin-slow" />
-                    <span className="text-[10px] font-bold">Chaves API</span>
-                  </button>
                 </div>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  Copie a ficha inteira ou mensagem de conversa enviada pelo cliente ou vendedor e cole no campo de texto abaixo. A IA interpretará e preencherá a estrutura automaticamente.
+                  Copie a ficha inteira ou mensagem de conversa enviada pelo cliente ou vendedor e cole no campo de texto abaixo. O sistema interpretará e preencherá a estrutura de forma local e automática.
                 </p>
 
                 {/* OBRIGATÓRIO: SELEÇÃO DE FORNECEDOR */}
@@ -3175,41 +2626,14 @@ export default function App() {
               </div>
 
               <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
-                {/* ⚡ ANÁLISE RÁPIDA TOGGLE */}
+                {/* ⚡ PREENCHIMENTO AUTOMÁTICO STATUS */}
                 <div className="flex flex-col gap-1">
-                  <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-700 bg-slate-100 hover:bg-slate-200 py-1.5 px-3 rounded-full transition font-extrabold shadow-3xs border border-slate-200">
-                    <input
-                      type="checkbox"
-                      checked={isRapidAnalysis}
-                      onChange={(e) => {
-                        const val = e.target.checked;
-                        setIsRapidAnalysis(val);
-                        localStorage.setItem('iazap_is_rapid', val ? 'true' : 'false');
-                      }}
-                      className="rounded text-rose-500 focus:ring-rose-500 w-3.5 h-3.5 accent-rose-500 cursor-pointer"
-                    />
-                    <span>⚡ Análise Rápida</span>
-                  </label>
-                  <div className="text-[10px] pl-1 font-bold">
-                    {isRapidAnalysis ? (
-                      <span className="text-emerald-700">Modo rápido ativo - sem uso de IA</span>
-                    ) : (
-                      <div className="flex items-center gap-1 text-blue-600">
-                        <span>Modo IA ativo</span>
-                        <span>•</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setActiveSettingsTab('keys');
-                            setShowSettingsModal(true);
-                          }}
-                          className="hover:underline font-extrabold text-slate-500 hover:text-rose-500 inline-flex items-center gap-0.5 cursor-pointer"
-                          title="Inserir ou editar chaves de API do Gemini"
-                        >
-                          Chaves API <Settings className="w-2.5 h-2.5 text-emerald-500" />
-                        </button>
-                      </div>
-                    )}
+                  <div className="inline-flex items-center gap-2 text-xs text-emerald-800 bg-emerald-50 py-1.5 px-3 rounded-full font-extrabold border border-emerald-200 shadow-3xs select-none">
+                    <Zap className="w-3.5 h-3.5 text-emerald-550 animate-pulse" />
+                    <span>⚡ Preenchimento Automático Ativo</span>
+                  </div>
+                  <div className="text-[10px] pl-1 font-bold text-slate-505">
+                    <span>Processamento 100% local, seguro e offline</span>
                   </div>
                 </div>
 
@@ -3246,7 +2670,7 @@ export default function App() {
                     className="bg-white border border-slate-200 hover:border-slate-300 text-slate-700 hover:bg-slate-50 text-xs py-2.5 px-4.5 rounded-full font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
                   >
                     <Plus className="w-3.5 h-3.5 text-slate-500" />
-                    Cadastrar Sem IA
+                    Cadastrar Manualmente
                   </button>
   
                   <button
@@ -3258,21 +2682,12 @@ export default function App() {
                     {isProcessingOrder ? (
                       <>
                         <RefreshCw className="w-4 h-4 animate-spin" />
-                        Analisando ficha...
+                        Preenchendo ficha...
                       </>
                     ) : (
                       <>
-                        {isRapidAnalysis ? (
-                          <>
-                            <Zap className="w-4 h-4 text-amber-200" />
-                            <span>Analisar de Forma Rápida</span>
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="w-4 h-4 text-blue-200" />
-                            <span>Analisar e Preencher Dados</span>
-                          </>
-                        )}
+                        <Zap className="w-4 h-4 text-emerald-305" />
+                        <span>Preencher Automaticamente</span>
                       </>
                     )}
                   </button>
@@ -3286,23 +2701,11 @@ export default function App() {
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="font-sans font-extrabold text-lg text-slate-900 flex items-center gap-2">
                     <span>2. Despachar Pedido Entregue</span>
-                    <span className="text-[10px] uppercase font-extrabold tracking-wider bg-emerald-50 text-emerald-600 px-2.5 py-0.5 rounded-full border border-emerald-100">IA Rápida</span>
+                    <span className="text-[10px] uppercase font-extrabold tracking-wider bg-emerald-50 text-emerald-600 px-2.5 py-0.5 rounded-full border border-emerald-100">Automático</span>
                   </h2>
-                  <button
-                    onClick={() => {
-                      setActiveSettingsTab('keys');
-                      setShowSettingsModal(true);
-                    }}
-                    type="button"
-                    className="p-1 px-2 hover:bg-rose-50 hover:text-rose-600 rounded-lg transition text-slate-400 cursor-pointer flex items-center gap-1 border border-slate-200/60 bg-slate-50/50"
-                    title="Configurar chaves de API Gemini (Engrenagem)"
-                  >
-                    <Settings className="w-3.5 h-3.5 text-emerald-500 animate-spin-slow" />
-                    <span className="text-[10px] font-bold">Chaves API</span>
-                  </button>
                 </div>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  Escreva ou cole a mensagem curta enviada pelo entregador. A inteligência artificial identificará o cliente ativo em aberto e mudará o status para <strong>Entregue</strong> simultaneamente.
+                  Escreva ou cole a mensagem curta enviada pelo entregador. O sistema identificará de forma automática o cliente ativo em aberto correspondente e mudará o status para <strong>Entregue</strong> simultaneamente.
                 </p>
                 <textarea
                   id="textarea-colar-entrega"
@@ -3362,7 +2765,7 @@ export default function App() {
 
                       <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4 mb-6">
                         <p className="text-xs font-semibold text-slate-600 leading-relaxed">
-                          A IA não decide nem salva comissões automaticamente. Confirme os valores calculados/digitados abaixo antes do envio final para o banco de dados:
+                          O sistema não decide nem salva comissões automaticamente. Confirme os valores calculados/digitados abaixo antes do envio final para o banco de dados:
                         </p>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
@@ -5629,17 +5032,7 @@ export default function App() {
                     <User className="w-4 h-4 text-rose-500" />
                     <span>Configuração de Operador</span>
                   </button>
-                  <button
-                    onClick={() => setActiveSettingsTab('keys')}
-                    className={`w-full text-left font-sans font-bold text-xs py-2.5 px-4 rounded-xl flex items-center gap-2.5 transition shrink-0 cursor-pointer ${
-                      activeSettingsTab === 'keys' 
-                        ? 'bg-rose-500 text-white shadow-sm' 
-                        : 'text-slate-600 hover:bg-slate-250 hover:text-slate-800'
-                    }`}
-                  >
-                    <Key className="w-4 h-4 text-emerald-500" />
-                    <span>Chaves de API Gemini</span>
-                  </button>
+
                 </div>
 
                 {/* Content Panel Area */}
@@ -6210,66 +5603,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {activeSettingsTab === 'keys' && (
-                    <div className="space-y-6 text-left animate-fade-in animate-duration-300 font-sans">
-                      <div className="flex items-center gap-2">
-                        <Key className="w-5 h-5 text-emerald-500" />
-                        <div>
-                          <h4 className="text-xs font-extrabold text-slate-900">Configuração de Múltiplas Chaves Gemini</h4>
-                          <p className="text-[10.5px] text-slate-500 font-medium">Cadastre até 4 chaves de API do Gemini para alternância e fallback automático se houver falhas.</p>
-                        </div>
-                      </div>
 
-                      <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-2xs space-y-4 max-w-lg">
-                        <div className="space-y-4">
-                          {[0, 1, 2, 3].map((idx) => (
-                            <div key={idx} className="space-y-1.5 font-sans">
-                              <div className="flex items-center justify-between">
-                                <label className="text-[9.5px] font-bold text-slate-500 uppercase tracking-widest block">
-                                  Chave de API Gemini {idx + 1}
-                                </label>
-                                {keyStatuses[idx] === 'testing' && <span className="text-[10px] font-bold text-blue-500 animate-pulse">⏳ Testando...</span>}
-                                {keyStatuses[idx] === 'success' && <span className="text-[10px] font-bold text-emerald-600">✅ Funcionando</span>}
-                                {keyStatuses[idx] === 'failed' && <span className="text-[10px] font-bold text-rose-500">❌ Falhou</span>}
-                              </div>
-                              <input
-                                type="password"
-                                placeholder={`Insira a chave de API ${idx + 1} (ex: AIzaSy...)`}
-                                value={aiKeys[idx] || ''}
-                                onChange={(e) => {
-                                  const updated = [...aiKeys];
-                                  updated[idx] = e.target.value.trim();
-                                  setAiKeys(updated);
-                                }}
-                                className="w-full bg-slate-50 border border-slate-200 focus:border-rose-500 focus:outline-hidden py-2 px-3.5 rounded-xl text-xs text-slate-950 font-mono transition"
-                              />
-                            </div>
-                          ))}
-                        </div>
-
-                        <div className="flex flex-wrap items-center gap-3">
-                          <button
-                            id="btn-save-keys"
-                            onClick={handleSaveAndValidateKeys}
-                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center gap-1.5 cursor-pointer transition shadow-2xs"
-                          >
-                            Salvar Chaves
-                          </button>
-                          <button
-                            id="btn-test-keys"
-                            onClick={handleTestKeys}
-                            className="bg-slate-700 hover:bg-slate-800 text-white font-extrabold text-xs py-2.5 px-4 rounded-xl flex items-center gap-1.5 cursor-pointer transition shadow-2xs"
-                          >
-                            Testar Chaves
-                          </button>
-                        </div>
-
-                        <div className="text-[10px] text-slate-500 font-medium bg-slate-50 p-3.5 rounded-xl border border-slate-200/60 leading-relaxed font-sans">
-                          💡 <strong>Fila de Fallback automático:</strong> O sistema tentará usar a Chave 1. Se ela falhar (erro 500, 503, timeout de 30s, etc.), tentará a Chave 2 automaticamente, e assim por diante. Se você não cadastrar nenhuma chave, o sistema utilizará o limite padrão global do servidor.
-                        </div>
-                      </div>
-                    </div>
-                  )}
 
                 </div>
               </div>
