@@ -32,6 +32,7 @@ import {
   ShieldCheck,
   Smartphone,
   Bell,
+  Coins,
   BarChart3,
   SlidersHorizontal,
   ArrowUpDown,
@@ -79,9 +80,21 @@ import {
 import * as XLSX from 'xlsx';
 import { 
   auth, 
+  db,
   isFirebaseConfigured,
   parseFirebaseError
 } from './firebase';
+import {
+  collection,
+  doc,
+  addDoc,
+  getDoc,
+  setDoc,
+  query,
+  orderBy,
+  onSnapshot,
+  serverTimestamp
+} from 'firebase/firestore';
 import { 
   signInAnonymously, 
   signOut
@@ -99,6 +112,27 @@ const getSupplierNameByKey = (key?: string): string => {
   if (key === 'MICHAEL') return 'Michael';
   if (key === 'FRANK') return 'Frank';
   return 'Outros Fornecedores';
+};
+
+const isSupplierMatch = (pSupplier?: string, targetKey?: string): boolean => {
+  if (!pSupplier || !targetKey) return false;
+  const pNorm = pSupplier.toUpperCase().trim();
+  const tNorm = targetKey.toUpperCase().trim();
+
+  if (pNorm === tNorm) return true;
+  if (tNorm === 'SOFIA_HOME_DECOR' && (pNorm === 'SOFIA HOME DECOR' || pNorm === 'SOFIA_HOME_DECOR' || pNorm === 'SOFIA')) {
+    return true;
+  }
+  if (tNorm === 'MICHAEL' && (pNorm === 'MICHAEL' || pNorm === 'MICHEL')) {
+    return true;
+  }
+  if (tNorm === 'FRANK' && (pNorm === 'FRANK')) {
+    return true;
+  }
+  if (tNorm === 'OUTROS' && (pNorm === 'OUTROS' || pNorm === 'OUTROS FORNECEDORES' || pNorm === 'OUTROS_FORNECEDORES' || pNorm === 'OTHER' || pNorm === 'OTHERS' || pNorm === '')) {
+    return true;
+  }
+  return false;
 };
 
 const parseBrazilianNumber = (valStr: string): number => {
@@ -202,6 +236,21 @@ export default function App() {
   const [selectedReportPeriod, setSelectedReportPeriod] = useState<'prev_week' | 'all'>('prev_week');
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
+
+  // Advanced filtration, Sofia payment, and history states (replaces old modal states)
+  const [reportsSupplierFilter, setReportsSupplierFilter] = useState<string>('ALL');
+  const [reportsPeriodFilter, setReportsPeriodFilter] = useState<string>('estaSemana'); // 'hoje', 'estaSemana', 'esteMes', 'custom'
+  const [reportsStartDate, setReportsStartDate] = useState<string>('');
+  const [reportsEndDate, setReportsEndDate] = useState<string>('');
+  const [weeklySnapshots, setWeeklySnapshots] = useState<any[]>([]);
+  const [commissionLogHistory, setCommissionLogHistory] = useState<any[]>([]);
+  const [activeReportTab, setActiveReportTab] = useState<string>('dashboard');
+
+  // Sofia payment confirmation state (Rule 3)
+  const [sofiaPaymentModalOpen, setSofiaPaymentModalOpen] = useState<boolean>(false);
+  const [sofiaPaymentOrderId, setSofiaPaymentOrderId] = useState<string | null>(null);
+  const [sofiaPaymentType, setSofiaPaymentType] = useState<'TRAFEGO' | 'DINHEIRO' | null>(null);
+  const [sofiaPaymentExtra, setSofiaPaymentExtra] = useState<{ newStatus: any; extra?: { dataReagendamento?: string } } | null>(null);
 
   // States for Backup and security system
   const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
@@ -605,6 +654,260 @@ export default function App() {
       return () => clearInterval(interval);
     }
   }, [pedidos, backupsHistory, authReady]);
+
+  // --- DETAILED REPORTING MODULE, HISTORIES AND SOFIA payment HELPERS (Rule 1, 2, 3, 5, 6, 7, 8, 9, 10) ---
+
+  const getPreviousFinishedWeekInterval = () => {
+    const today = new Date();
+    const currentDay = today.getDay(); // 0 = Sunday, 1 = Monday, ...
+    const daysToSubtract = currentDay === 0 ? 13 : (currentDay - 1) + 7;
+    
+    const prevMonday = new Date(today);
+    prevMonday.setDate(today.getDate() - daysToSubtract);
+    prevMonday.setHours(12, 0, 0, 0);
+
+    const prevSunday = new Date(prevMonday);
+    prevSunday.setDate(prevMonday.getDate() + 6);
+    prevSunday.setHours(12, 0, 0, 0);
+
+    const formatDDMMYYYY = (d: Date) => {
+      const dd = String(d.getDate()).padStart(2, '0');
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const yyyy = d.getFullYear();
+      return `${dd}/${mm}/${yyyy}`;
+    };
+
+    return {
+      startDate: formatDDMMYYYY(prevMonday),
+      endDate: formatDDMMYYYY(prevSunday),
+      prevMondayDate: prevMonday, 
+      prevSundayDate: prevSunday
+    };
+  };
+
+  const checkAndSaveWeeklySnapshot = async (allPedidos: Pedido[]) => {
+    if (allPedidos.length === 0) return;
+    try {
+      const { startDate, endDate, prevMondayDate, prevSundayDate } = getPreviousFinishedWeekInterval();
+      const weekId = `${startDate.substring(0, 5)}-${endDate.substring(0, 5)}`; // e.g. "08/06-14/06"
+      
+      const suppliers: { id: string; label: string }[] = [
+        { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' },
+        { id: 'MICHAEL', label: 'Michael' },
+        { id: 'FRANK', label: 'Frank' },
+        { id: 'OUTROS', label: 'Outros Fornecedores' }
+      ];
+
+      for (const supplier of suppliers) {
+        const docId = `snapshot-${weekId.replace(/\//g, "-")}-${supplier.id}`;
+        
+        let exists = false;
+        if (isFirebaseConfigured && db) {
+          try {
+            const docSnap = await getDoc(doc(db, "weekly_snapshots", docId));
+            exists = docSnap.exists();
+          } catch (e) {
+            // Silently swallow
+          }
+        } else {
+          const localSnapshots = localStorage.getItem("iazap_weekly_snapshots");
+          if (localSnapshots) {
+            const parsed = JSON.parse(localSnapshots);
+            exists = parsed.some((s: any) => s.id === docId);
+          }
+        }
+
+        if (exists) {
+          continue; 
+        }
+
+        const supplierOrders = allPedidos.filter(p => {
+          const isSupp = p.supplier === supplier.id || (supplier.id === 'SOFIA_HOME_DECOR' && (p.supplier as string) === 'Sofia Home Decor') ||
+                         (supplier.id === 'MICHAEL' && (p.supplier as string) === 'Michael') ||
+                         (supplier.id === 'FRANK' && (p.supplier as string) === 'Frank') ||
+                         (supplier.id === 'OUTROS' && (p.supplier as string) === 'Outros Fornecedores');
+          if (!isSupp) return false;
+          
+          const d = getPedidoDate(p);
+          const pTime = d.setHours(0,0,0,0);
+          const mTime = new Date(prevMondayDate).setHours(0,0,0,0);
+          const sTime = new Date(prevSundayDate).setHours(0,0,0,0);
+          return pTime >= mTime && pTime <= sTime;
+        });
+
+        const faturamento = supplierOrders
+          .filter(o => o.status !== 'CANCELLED')
+          .reduce((sum, o) => sum + (o.valorTotal || 0), 0);
+        const comissaoRecebida = supplierOrders
+          .filter(o => o.status === 'DELIVERED')
+          .reduce((sum, o) => sum + (o.comissao || 0), 0);
+        const comissaoPendente = supplierOrders
+          .filter(o => o.status !== 'DELIVERED' && o.status !== 'CANCELLED')
+          .reduce((sum, o) => sum + (o.comissao || 0), 0);
+        const pedidosEntregues = supplierOrders.filter(o => o.status === 'DELIVERED').length;
+        const pedidosPendentes = supplierOrders.filter(o => o.status !== 'DELIVERED' && o.status !== 'CANCELLED').length;
+        const pedidosCancelados = supplierOrders.filter(o => o.status === 'CANCELLED').length;
+
+        const snapshotPayload = {
+          id: docId,
+          startDate,
+          endDate,
+          fornecedor: supplier.label,
+          faturamento,
+          comissaoRecebida,
+          comissaoPendente,
+          pedidosEntregues,
+          pedidosPendentes,
+          pedidosCancelados,
+          createdAt: Date.now()
+        };
+
+        if (isFirebaseConfigured && db) {
+          await setDoc(doc(db, "weekly_snapshots", docId), snapshotPayload);
+        } else {
+          const localSnapshots = localStorage.getItem("iazap_weekly_snapshots") || "[]";
+          const parsed = JSON.parse(localSnapshots);
+          parsed.push(snapshotPayload);
+          localStorage.setItem("iazap_weekly_snapshots", JSON.stringify(parsed));
+          window.dispatchEvent(new Event("iazap_db_update"));
+        }
+      }
+    } catch (err) {
+      console.error("Error checkAndSaveWeeklySnapshot:", err);
+    }
+  };
+
+  const logCommissionChange = async (pedidoId: string, numeroVenda: string, supplier: string, cliente: string, valorAnterior: number, valorNovo: number) => {
+    try {
+      const changeLog = {
+        pedidoId,
+        numeroVenda,
+        fornecedor: supplier,
+        cliente,
+        valorAnterior,
+        valorNovo,
+        alteradoPor: currentUser?.name || currentUser?.username || 'Sistema',
+        timestamp: new Date().toLocaleString('pt-BR')
+      };
+
+      if (isFirebaseConfigured && db) {
+        await addDoc(collection(db, "commission_changes_history"), changeLog);
+      } else {
+        const localLogs = localStorage.getItem("iazap_commission_changes_history") || "[]";
+        const parsed = JSON.parse(localLogs);
+        parsed.push({ id: `log-${Date.now()}`, ...changeLog });
+        localStorage.setItem("iazap_commission_changes_history", JSON.stringify(parsed));
+        window.dispatchEvent(new Event("iazap_db_update"));
+      }
+    } catch (e) {
+      console.error("Error logging commission change:", e);
+    }
+  };
+
+  const getSupplierResumo = (selectedPeriod: string, customStart?: string, customEnd?: string) => {
+    const suppliers = [
+      { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' },
+      { id: 'MICHAEL', label: 'Michael' },
+      { id: 'FRANK', label: 'Frank' },
+      { id: 'OUTROS', label: 'Outros Fornecedores' }
+    ];
+
+    let totalGeralFaturamento = 0;
+    let totalGeralComissao = 0;
+
+    const list = suppliers.map(s => {
+      const suppOrders = pedidos.filter(p => {
+        const matchesSupp = isSupplierMatch(p.supplier, s.id);
+        if (!matchesSupp) return false;
+
+        const date = getPedidoDate(p);
+        return checkDateInPreset(date, selectedPeriod, customStart, customEnd);
+      });
+
+      const faturamento = suppOrders
+        .filter(o => o.status !== 'CANCELLED')
+        .reduce((sum, o) => sum + (o.valorTotal || 0), 0);
+      const comissao = suppOrders
+        .filter(o => o.status !== 'CANCELLED')
+        .reduce((sum, o) => sum + (o.comissao || 0), 0);
+
+      totalGeralFaturamento += faturamento;
+      totalGeralComissao += comissao;
+
+      return {
+        label: s.label,
+        faturamento,
+        comissao
+      };
+    });
+
+    return {
+      list,
+      totalGeralFaturamento,
+      totalGeralComissao
+    };
+  };
+
+  // Run weekly snapshot checker on raw orders list change
+  useEffect(() => {
+    if (pedidos.length > 0 && authReady) {
+      checkAndSaveWeeklySnapshot(pedidos);
+    }
+  }, [pedidos, authReady]);
+
+  // Load/subscribe snapshot & commission logs databases
+  useEffect(() => {
+    if (isFirebaseConfigured && db) {
+      const qSnap = query(collection(db, "weekly_snapshots"));
+      const unsubSnap = onSnapshot(qSnap, (snap) => {
+        const list: any[] = [];
+        snap.forEach((docSnap) => {
+          list.push({ id: docSnap.id, ...docSnap.data() });
+        });
+        list.sort((a, b) => b.id.localeCompare(a.id));
+        setWeeklySnapshots(list);
+      }, (err) => {
+        console.error("Error onSnapshot weekly_snapshots:", err);
+      });
+
+      const qCom = query(collection(db, "commission_changes_history"));
+      const unsubCom = onSnapshot(qCom, (snap) => {
+        const list: any[] = [];
+        snap.forEach((docCom) => {
+          list.push({ id: docCom.id, ...docCom.data() });
+        });
+        list.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+        setCommissionLogHistory(list);
+      }, (err) => {
+        console.error("Error onSnapshot commission_changes_history:", err);
+      });
+
+      return () => {
+        unsubSnap();
+        unsubCom();
+      };
+    } else {
+      const loadLocal = () => {
+        try {
+          const rawSnaps = localStorage.getItem("iazap_weekly_snapshots") || "[]";
+          const parsedSnaps = JSON.parse(rawSnaps);
+          parsedSnaps.sort((a: any, b: any) => b.id.localeCompare(a.id));
+          setWeeklySnapshots(parsedSnaps);
+
+          const rawCom = localStorage.getItem("iazap_commission_changes_history") || "[]";
+          const parsedCom = JSON.parse(rawCom);
+          parsedCom.sort((a: any, b: any) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+          setCommissionLogHistory(parsedCom);
+        } catch (e) {}
+      };
+
+      loadLocal();
+      window.addEventListener("iazap_db_update", loadLocal);
+      return () => {
+        window.removeEventListener("iazap_db_update", loadLocal);
+      };
+    }
+  }, [isFirebaseConfigured, authReady]);
 
   // Create manual backup
   const handleGenerateManualBackup = async () => {
@@ -1416,8 +1719,7 @@ export default function App() {
 
       // If matching score is decent (e.g., at least matches 40% of the name or at least 1 complete word)
       if (bestMatch && maxMatchScore >= 0.3) {
-        await updatePedidoStatus(bestMatch.id, 'DELIVERED', undefined, currentUser?.name || currentUser?.username || 'Sistema', bestMatch.supplier);
-        triggerToast('success', `Confirmado! Pedido ${bestMatch.numeroVenda} (${bestMatch.nomeCompleto}) marcado como Entregue via busca local.`);
+        await handleQuickStatusUpdate(bestMatch.id, 'DELIVERED');
         setPasteDeliveryText('');
       } else {
         triggerToast('refused', 'Não foi possível associar esta confirmação a nenhum de seus pedidos ativos (nenhum nome correspondente encontrado).');
@@ -1499,6 +1801,21 @@ export default function App() {
         supplier: getSupplierKeyByName(fornecedorSelecionado)
       };
 
+      // Audit commission changes (Rule 10)
+      if (payload.id) {
+        const original = pedidos.find(p => p.id === payload.id);
+        if (original && original.comissao !== payload.comissao) {
+          await logCommissionChange(
+            original.id,
+            original.numeroVenda || payload.numeroVenda || '',
+            original.supplier || 'OUTROS',
+            original.nomeCompleto || payload.nomeCompleto || '',
+            original.comissao || 0,
+            payload.comissao || 0
+          );
+        }
+      }
+
       await savePedido(payload, currentUser?.name || currentUser?.username || 'Sistema');
       
       // Memorize patterns found in the successfully saved order
@@ -1520,9 +1837,20 @@ export default function App() {
 
 
   // Fast manually trigger status update without AI
-  const handleQuickStatusUpdate = async (id: string, newStatus: any, extra?: { dataReagendamento?: string }) => {
+  const handleQuickStatusUpdate = async (id: string, newStatus: any, extra?: { dataReagendamento?: string; tipoRecebimento?: 'TRAFEGO' | 'DINHEIRO' }) => {
     const updated = pedidos.find(p => p.id === id);
     if (!updated) return;
+
+    // Check Sofia Home Decor Rule (Rule 3)
+    const isSofia = (updated.supplier || 'SOFIA_HOME_DECOR') === 'SOFIA_HOME_DECOR' || updated.supplier === 'Sofia Home Decor';
+    if ((newStatus === 'DELIVERED' || newStatus === 'Entregue') && isSofia && (!extra || !extra.tipoRecebimento)) {
+      setSofiaPaymentOrderId(id);
+      setSofiaPaymentType(null); // Reset selection
+      setSofiaPaymentExtra({ newStatus, extra });
+      setSofiaPaymentModalOpen(true);
+      setShowDropdownId(null);
+      return;
+    }
 
     if (newStatus === 'RESCHEDULED' && (!extra || !extra.dataReagendamento)) {
       setReschedulingPedido(updated);
@@ -1931,16 +2259,16 @@ export default function App() {
   };
 
   // 11. CONTROLE DE COMISSÃO & 12. PAINEL DE RESUMO CALCULATIONS
-  const totalVendidosSum = currentSupplierPedidos
+  const totalVendidosSum = pedidos
     .filter(p => p.status !== 'CANCELLED')
     .reduce((sum, p) => sum + (p.valorTotal || 0), 0);
-  const totalComissoesSum = currentSupplierPedidos
+  const totalComissoesSum = pedidos
     .filter(p => p.status !== 'CANCELLED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
-  const totalComissoesRecebidas = currentSupplierPedidos
+  const totalComissoesRecebidas = pedidos
     .filter(p => p.status === 'DELIVERED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
-  const totalComissoesPendentes = currentSupplierPedidos
+  const totalComissoesPendentes = pedidos
     .filter(p => p.status !== 'DELIVERED' && p.status !== 'CANCELLED')
     .reduce((sum, p) => sum + (p.comissao || 0), 0);
   
@@ -2222,6 +2550,18 @@ export default function App() {
     if (currentVal === castedVal) return;
 
     try {
+      // Audit commission changes (Rule 10)
+      if (field === 'comissao') {
+        await logCommissionChange(
+          target.id,
+          target.numeroVenda || '',
+          target.supplier || 'OUTROS',
+          target.nomeCompleto || '',
+          Number(currentVal) || 0,
+          Number(castedVal) || 0
+        );
+      }
+
       const updated = { ...target, [field]: castedVal };
       await savePedido(updated, currentUser?.name || currentUser?.username || 'Sistema');
       triggerToast('success', `Célula sincronizada em tempo real!`);
@@ -3130,11 +3470,13 @@ export default function App() {
           {/* SECTION: 4 BENTO SUMMARY COUNTS STATISTICS */}
           <section className="grid grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6">
             
-            {/* CARD 1: TOTAL DE PEDIDOS */}
+            {/* CARD 1: PEDIDOS CONVERTIDOS */}
             <div className="bg-white rounded-3xl p-6 shadow-sm hover:shadow-md border border-slate-200/80 hover:border-brand/30 transition flex items-center justify-between group">
               <div>
-                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Total de Vendas</span>
-                <span className="text-2xl sm:text-3xl font-bold text-slate-900 mt-1 block font-sans tracking-tight">{currentSupplierPedidos.length}</span>
+                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Pedidos Convertidos</span>
+                <span className="text-2xl sm:text-3xl font-bold text-slate-900 mt-1 block font-sans tracking-tight">
+                  {pedidos.filter(p => p.status !== 'CANCELLED').length}
+                </span>
               </div>
               <div className="bg-brand/10 text-brand p-3 rounded-2xl group-hover:scale-110 transition duration-300">
                 <FileText className="w-5 h-5" />
@@ -3273,7 +3615,7 @@ export default function App() {
                       }}
                       className={`px-4 sm:px-6 py-1.5 rounded-full text-xs font-extrabold transition flex items-center gap-1.5 cursor-pointer select-none ${
                         currentTab === 'ativos' 
-                          ? 'bg-brand text-white shadow-xs' 
+                          ? 'bg-brand text-black shadow-xs' 
                           : 'text-slate-500 hover:text-brand'
                       }`}
                     >
@@ -4668,25 +5010,252 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* MODAL DE RELATÓRIOS (Reports summary dashboard overlay) */}
+      {/* Sofia Home Decor Payment Intercept Modal (Rule 3) */}
+      <AnimatePresence>
+        {sofiaPaymentModalOpen && (
+          <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-55 animate-fade-in animate-duration-150">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-3xl shadow-2xl p-6 max-w-sm w-full border border-slate-200 flex flex-col text-left space-y-5"
+            >
+              <div className="flex items-center gap-3">
+                <div className="bg-brand/10 text-brand p-2.5 rounded-2xl">
+                  <Coins className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-sans font-extrabold text-sm text-slate-800 uppercase tracking-wider">Confirmar Recebimento</h3>
+                  <p className="text-[10px] text-slate-500 font-bold">Sofia Home Decor • Venda #{(pedidos.find(p => p.id === sofiaPaymentOrderId)?.numeroVenda) || ''}</p>
+                </div>
+              </div>
+
+              <div className="border-t border-slate-100 my-1"></div>
+
+              <div className="space-y-3">
+                <p className="text-xs font-semibold text-slate-700">Como esta venda foi paga?</p>
+                
+                <label className={`flex items-center gap-3 p-3.5 rounded-2xl border cursor-pointer transition ${sofiaPaymentType === 'TRAFEGO' ? 'border-brand bg-brand/[0.04] text-brand-dark' : 'border-slate-200 text-slate-655 hover:bg-slate-50'}`}>
+                  <input
+                    type="radio"
+                    name="sofia_payment_type"
+                    value="TRAFEGO"
+                    checked={sofiaPaymentType === 'TRAFEGO'}
+                    onChange={() => setSofiaPaymentType('TRAFEGO')}
+                    className="sr-only"
+                  />
+                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${sofiaPaymentType === 'TRAFEGO' ? 'border-brand bg-brand' : 'border-slate-300'}`}>
+                    {sofiaPaymentType === 'TRAFEGO' && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold block">Descontado no Tráfego</span>
+                    <span className="text-[10px] text-slate-400 block font-medium">Lançado como créditos para campanhas</span>
+                  </div>
+                </label>
+
+                <label className={`flex items-center gap-3 p-3.5 rounded-2xl border cursor-pointer transition ${sofiaPaymentType === 'DINHEIRO' ? 'border-emerald-500 bg-emerald-50/[0.1] text-emerald-850' : 'border-slate-200 text-slate-655 hover:bg-slate-50'}`}>
+                  <input
+                    type="radio"
+                    name="sofia_payment_type"
+                    value="DINHEIRO"
+                    checked={sofiaPaymentType === 'DINHEIRO'}
+                    onChange={() => setSofiaPaymentType('DINHEIRO')}
+                    className="sr-only"
+                  />
+                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${sofiaPaymentType === 'DINHEIRO' ? 'border-emerald-500 bg-emerald-500' : 'border-slate-300'}`}>
+                    {sofiaPaymentType === 'DINHEIRO' && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold block">Pago em Dinheiro</span>
+                    <span className="text-[10px] text-slate-400 block font-medium">Recebimento em dinheiro físico / depósito</span>
+                  </div>
+                </label>
+              </div>
+
+              <div className="flex gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSofiaPaymentModalOpen(false);
+                    setSofiaPaymentOrderId(null);
+                    setSofiaPaymentType(null);
+                    setSofiaPaymentExtra(null);
+                    triggerToast('info', 'Mudança de status cancelada.');
+                  }}
+                  className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs py-2.5 px-4 rounded-full font-bold transition text-center cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={!sofiaPaymentType}
+                  onClick={async () => {
+                    if (!sofiaPaymentOrderId || !sofiaPaymentType) return;
+                    const orderId = sofiaPaymentOrderId;
+                    const payType = sofiaPaymentType;
+                    const ext = sofiaPaymentExtra || { newStatus: 'DELIVERED' };
+
+                    setSofiaPaymentModalOpen(false);
+                    setSofiaPaymentOrderId(null);
+                    setSofiaPaymentType(null);
+                    setSofiaPaymentExtra(null);
+
+                    await handleQuickStatusUpdate(orderId, ext.newStatus, { 
+                      ...ext.extra, 
+                      tipoRecebimento: payType 
+                    });
+                  }}
+                  className="flex-1 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs py-2.5 px-4 rounded-full font-bold transition text-center cursor-pointer"
+                >
+                  Confirmar
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL DE RELATÓRIOS (Reports summary dashboard overlay) (Rule 1, 2, 4, 5, 6, 7, 8, 9) */}
       <AnimatePresence>
         {showReportsModal && (() => {
-          const rep = parseReportData();
+          // Calculate filtered list of orders for reporting
+          const filteredPedidosForReport = pedidos.filter(p => {
+            // Supplier Filter check
+            if (reportsSupplierFilter !== 'ALL') {
+              const matched = isSupplierMatch(p.supplier, reportsSupplierFilter);
+              if (!matched) return false;
+            }
+
+            // Date Period check
+            const date = getPedidoDate(p);
+            return checkDateInPreset(date, reportsPeriodFilter, reportsStartDate, reportsEndDate);
+          });
+
+          // Metrics calculations based on selection
+          const faturamentoBruto = filteredPedidosForReport
+            .filter(o => o.status !== 'CANCELLED')
+            .reduce((sum, o) => sum + (o.valorTotal || 0), 0);
+          const comissaoGerada = filteredPedidosForReport
+            .filter(o => o.status !== 'CANCELLED')
+            .reduce((sum, o) => sum + (o.comissao || 0), 0);
+          const comissaoRecebida = filteredPedidosForReport
+            .filter(o => o.status === 'DELIVERED')
+            .reduce((sum, o) => sum + (o.comissao || 0), 0);
+          const comissaoPendente = filteredPedidosForReport
+            .filter(o => o.status !== 'DELIVERED' && o.status !== 'CANCELLED')
+            .reduce((sum, o) => sum + (o.comissao || 0), 0);
+
+          const totalPedidosCount = filteredPedidosForReport.filter(o => o.status !== 'CANCELLED').length;
+          const entreguesCount = filteredPedidosForReport.filter(o => o.status === 'DELIVERED').length;
+          const pendentesCount = filteredPedidosForReport.filter(o => o.status !== 'DELIVERED' && o.status !== 'CANCELLED').length;
+          const canceladosCount = filteredPedidosForReport.filter(o => o.status === 'CANCELLED').length;
+
+          // Excel exports functions
+          const exportExcelFiltered = () => {
+            if (filteredPedidosForReport.length === 0) {
+              triggerToast('error', 'Nenhum pedido no período filtrado para exportar.');
+              return;
+            }
+            try {
+              const exportData = filteredPedidosForReport.map(o => ({
+                'ID': o.id || '',
+                'N° Venda': o.numeroVenda || '',
+                'Data': o.data || '',
+                'Cliente': o.nomeCompleto || '',
+                'Cidade': o.city || '',
+                'Estado': o.state || '',
+                'Fornecedor': o.supplier === 'SOFIA_HOME_DECOR' || o.supplier === 'Sofia Home Decor' ? 'Sofia Home Decor' :
+                              o.supplier === 'MICHAEL' || o.supplier === 'Michael' ? 'Michael' :
+                              o.supplier === 'FRANK' || o.supplier === 'Frank' ? 'Frank' : 'Outros Fornecedores',
+                'Produto': o.produto || '',
+                'Valor Total': o.valorTotal || 0,
+                'Comissão': o.comissao || 0,
+                'Status': o.status === 'PENDING' ? 'Pendente' :
+                          o.status === 'DELIVERED' ? 'Entregue' :
+                          o.status === 'CANCELLED' ? 'Cancelado' : o.status,
+                'Tipo Recebimento': o.tipoRecebimento || 'N/A'
+              }));
+
+              const ws = XLSX.utils.json_to_sheet(exportData);
+              const wb = XLSX.utils.book_new();
+              XLSX.utils.book_append_sheet(wb, ws, "Relatório Filtrado");
+              XLSX.writeFile(wb, `Filtro_Relatorio_${reportsSupplierFilter}_${reportsPeriodFilter}.xlsx`);
+              triggerToast('success', 'Relatório exportado com sucesso!');
+            } catch (err: any) {
+              triggerToast('error', `Falha ao exportar excel: ${err.message}`);
+            }
+          };
+
+          const exportCityReport = () => {
+            if (filteredPedidosForReport.length === 0) {
+              triggerToast('error', 'Sem pedidos no período para exportar relatório de cidades.');
+              return;
+            }
+            try {
+              // Group and aggregate by City
+              const cityMap: Record<string, { city: string; salesCount: number; salesValue: number; commission: number }> = {};
+              filteredPedidosForReport.forEach(o => {
+                const cityName = (o.city || 'NÃO INFORMADA').toUpperCase().trim();
+                if (!cityMap[cityName]) {
+                  cityMap[cityName] = {
+                    city: cityName,
+                    salesCount: 0,
+                    salesValue: 0,
+                    commission: 0
+                  };
+                }
+                cityMap[cityName].salesCount += 1;
+                if (o.status !== 'CANCELLED') {
+                  cityMap[cityName].salesValue += o.valorTotal || 0;
+                  cityMap[cityName].commission += o.comissao || 0;
+                }
+              });
+
+              // Convert to array and sort descending by salesCount
+              const aggregatedData = Object.values(cityMap).sort((a, b) => b.salesCount - a.salesCount);
+
+              const exportData = aggregatedData.map(c => ({
+                'Cidade': c.city,
+                'Quantidade de Vendas': c.salesCount,
+                'Valor de Vendas': c.salesValue,
+                'Comissão Gerada': c.commission
+              }));
+
+              const ws = XLSX.utils.json_to_sheet(exportData);
+              const wb = XLSX.utils.book_new();
+              XLSX.utils.book_append_sheet(wb, ws, "Cidades");
+              XLSX.writeFile(wb, `Relatorio_Cidades_${reportsPeriodFilter}.xlsx`);
+              triggerToast('success', 'Relatório de Cidades exportado com sucesso!');
+            } catch (err: any) {
+              triggerToast('error', `Falha ao gerar relatório por cidades: ${err.message}`);
+            }
+          };
+
+          const handlePresetPeriodClick = (preset: string) => {
+            setReportsPeriodFilter(preset);
+            if (preset !== 'custom') {
+              setReportsStartDate('');
+              setReportsEndDate('');
+            }
+          };
+
           return (
             <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
               <motion.div 
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-[#f8fafc] rounded-3xl shadow-2xl w-full max-w-3xl overflow-hidden border border-slate-200/80 flex flex-col max-h-[85vh]"
+                className="bg-[#f8fafc] rounded-3xl shadow-2xl w-full max-w-4xl overflow-hidden border border-slate-200/80 flex flex-col max-h-[90vh]"
               >
-                {/* Header */}
+                {/* Header with high contrast gradient */}
                 <div className="px-6 py-5 bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <BarChart3 className="w-5 h-5 text-brand" />
+                  <div className="flex items-center gap-3">
+                    <div className="bg-brand/10 text-brand p-2 rounded-2xl">
+                      <BarChart3 className="w-5 h-5 text-brand" />
+                    </div>
                     <div>
-                      <h3 className="font-sans font-extrabold text-sm uppercase tracking-wider">Painel de Relatório Comercial</h3>
-                      <p className="text-[10px] text-slate-300 font-medium">Automaticamente compilado a partir de vendas registradas</p>
+                      <h3 className="font-sans font-extrabold text-sm uppercase tracking-wider">Centro de Gestão Comercial / Relatórios</h3>
+                      <p className="text-[10px] text-slate-300 font-medium">Controle de faturamento, comissões em tempo real, históricos e auditoria</p>
                     </div>
                   </div>
                   <button 
@@ -4697,96 +5266,461 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Body Content */}
-                <div className="p-6 overflow-y-auto space-y-6 flex-1">
-                  
-                  {/* Period Banner Card */}
-                  <div className="bg-white rounded-2xl border border-slate-150 p-4.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
-                    <div>
-                      <span className="text-[9px] font-extrabold text-[#64748b] uppercase tracking-wider">Período de Análise</span>
-                      <h4 className="text-sm font-extrabold text-slate-800 flex items-center gap-1.5 mt-0.5">
-                        <Calendar className="w-4 h-4 text-brand" />
-                        {rep.periodo}
-                      </h4>
-                      {rep.wasFallback && (
-                        <p className="text-[10px] text-amber-600 mt-1 font-medium bg-amber-50 px-2 py-0.5 rounded-md inline-block font-sans">Nenhum pedido na semana anterior; apresentando os dados históricos completos.</p>
-                      )}
-                    </div>
-                    <div className="text-xs bg-slate-100 font-semibold px-3 py-1.5 rounded-xl border border-slate-250 text-slate-600 uppercase tracking-widest text-[9px] font-mono shrink-0">
-                      ZAP REGISTRO PRO v1.2
-                    </div>
-                  </div>
-
-                  {/* High Contrast Mini Bento metrics cards */}
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    {/* Faturamento */}
-                    <div className="bg-white p-4 rounded-2xl border border-slate-150 shadow-xs">
-                      <span className="text-[9px] font-extrabold text-slate-400 uppercase tracking-wider block">Faturamento Bruto</span>
-                      <p className="text-lg font-black text-slate-900 mt-1">R$ {rep.faturamento.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                      <span className="text-[9px] text-slate-400 font-mono">Relação de vendas diretas</span>
-                    </div>
-
-                    {/* Vendas Count */}
-                    <div className="bg-white p-4 rounded-2xl border border-slate-150 shadow-xs">
-                      <span className="text-[9px] font-extrabold text-slate-400 uppercase tracking-wider block">Pedidos Convertidos</span>
-                      <p className="text-lg font-black text-slate-900 mt-1">{rep.vendasCount}</p>
-                      <span className="text-[9px] text-[#2563eb] font-semibold mt-1 flex items-center gap-0.5 font-sans">
-                        <span className="text-emerald-500 font-bold">{rep.entreguesCount}</span> entregues • <span className="text-amber-550 font-bold">{rep.pendentesCount}</span> ativos
-                      </span>
-                    </div>
-
-                    {/* Comissão Gerada */}
-                    <div className="bg-[#2563eb]/[0.02] p-4 rounded-2xl border border-brand/10 shadow-xs">
-                      <span className="text-[9px] font-extrabold text-brand uppercase tracking-wider block">Comissão Acumulada</span>
-                      <p className="text-lg font-black text-brand mt-1">R$ {rep.comissaoGerada.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                      <span className="text-[9px] text-slate-400 font-mono">Potencial ganho semanal</span>
-                    </div>
-
-                    {/* Comissão Recebida */}
-                    <div className="bg-emerald-50/[0.08] p-4 rounded-2xl border border-emerald-100 shadow-xs">
-                      <span className="text-[9px] font-extrabold text-emerald-600 uppercase tracking-wider block">Comissão Liquidada</span>
-                      <p className="text-lg font-black text-emerald-600 mt-1">R$ {rep.comissaoRecebida.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                      <span className="text-[9px] text-slate-400 font-mono">Calculado de pedidos entregues</span>
+                {/* Subheader Toolbar & Filter Selections */}
+                <div className="bg-white border-b border-slate-200/80 p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Supplier filter choices */}
+                  <div className="space-y-1.5 text-left">
+                    <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider block">Fornecedor</label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[
+                        { id: 'ALL', label: 'Todos' },
+                        { id: 'SOFIA_HOME_DECOR', label: 'Sofia' },
+                        { id: 'MICHAEL', label: 'Michael' },
+                        { id: 'FRANK', label: 'Frank' },
+                        { id: 'OUTROS', label: 'Outros' }
+                      ].map(sup => (
+                        <button
+                          key={sup.id}
+                          onClick={() => setReportsSupplierFilter(sup.id)}
+                          className={`px-3 py-1.5 rounded-full text-xs font-bold transition select-none cursor-pointer ${
+                            reportsSupplierFilter === sup.id 
+                              ? 'bg-slate-900 text-white shadow-xs' 
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200/85'
+                          }`}
+                        >
+                          {sup.label}
+                        </button>
+                      ))}
                     </div>
                   </div>
 
-                  {/* Commission Progress Indicator Bar */}
-                  <div className="bg-white p-5 rounded-2xl border border-slate-155 shadow-xs space-y-3">
-                    <div className="flex items-center justify-between">
-                      <h5 className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Aproveitamento de Comissão Recebida</h5>
-                      <span className="text-xs font-bold font-mono text-emerald-650">
-                        {rep.comissaoGerada > 0 ? Math.round((rep.comissaoRecebida / rep.comissaoGerada) * 100) : 0}%
-                      </span>
+                  {/* Period filter choices */}
+                  <div className="space-y-1.5 text-left">
+                    <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider block">Período de Filtragem</label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[
+                        { id: 'hoje', label: 'Hoje' },
+                        { id: 'estaSemana', label: 'Esta Semana' },
+                        { id: 'esteMes', label: 'Este Mês' },
+                        { id: 'custom', label: 'Range' }
+                      ].map(per => (
+                        <button
+                          key={per.id}
+                          onClick={() => handlePresetPeriodClick(per.id)}
+                          className={`px-3 py-1.5 rounded-full text-xs font-bold transition select-none cursor-pointer ${
+                            reportsPeriodFilter === per.id 
+                              ? 'bg-brand text-brand-dark shadow-xs' 
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200/85'
+                          }`}
+                        >
+                          {per.label}
+                        </button>
+                      ))}
                     </div>
-                    <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
-                      <div 
-                        className="bg-emerald-500 h-full rounded-full transition-all duration-500"
-                        style={{ width: `${rep.comissaoGerada > 0 ? (rep.comissaoRecebida / rep.comissaoGerada) * 100 : 0}%` }}
-                      ></div>
-                    </div>
-                    <p className="text-[10px] text-slate-400">Esta barra de aproveitamento indica qual percentual de sua comissão potencial já foi liquidada com status <strong>"Entregue"</strong> versus o que ainda se encontra pendente ou em rota.</p>
+                    {reportsPeriodFilter === 'custom' && (
+                      <div className="flex items-center gap-2 pt-1">
+                        <input
+                          type="date"
+                          value={reportsStartDate}
+                          onChange={(e) => setReportsStartDate(e.target.value)}
+                          className="bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1 text-xs font-semibold text-slate-700 focus:outline-none focus:border-brand"
+                        />
+                        <span className="text-slate-400 text-xs font-medium">até</span>
+                        <input
+                          type="date"
+                          value={reportsEndDate}
+                          onChange={(e) => setReportsEndDate(e.target.value)}
+                          className="bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1 text-xs font-semibold text-slate-700 focus:outline-none focus:border-brand"
+                        />
+                      </div>
+                    )}
                   </div>
+                </div>
 
+                {/* Sub Navigation Tabs */}
+                <div className="bg-slate-100 border-b border-slate-200/80 px-6 py-2 flex gap-4 overflow-x-auto shrink-0 select-none">
+                  {['dashboard', 'weekSummary', 'financeAudit', 'snapshots', 'logs'].map(tab => (
+                    <button
+                      key={tab}
+                      onClick={() => setActiveReportTab(tab)}
+                      className={`text-xs font-bold py-1.5 px-3 rounded-xl transition cursor-pointer shrink-0 ${
+                        activeReportTab === tab 
+                          ? 'bg-white border text-slate-900 border-slate-200/60 shadow-xs' 
+                          : 'text-slate-500 hover:text-slate-900'
+                      }`}
+                    >
+                      {tab === 'dashboard' && 'Dashboard de Vendas'}
+                      {tab === 'weekSummary' && 'Resumo das Semanais'}
+                      {tab === 'financeAudit' && '🔍 Auditoria Financeira'}
+                      {tab === 'snapshots' && 'Históricos de Fechamento'}
+                      {tab === 'logs' && 'Logs de Auditoria'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Main Render Section based on tabs */}
+                <div className="p-6 overflow-y-auto space-y-6 flex-1 text-left min-h-0 bg-[#fbfcfd]">
+                  {(() => {
+                    const activeTab = activeReportTab;
+
+                    if (activeTab === 'dashboard') {
+                      return (
+                        <div className="space-y-6">
+                          {/* Bento Grid Metrics */}
+                          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                            <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
+                              <span className="text-[9px] font-extrabold text-slate-400 uppercase tracking-wider block">Faturamento Bruto</span>
+                              <p className="text-xl font-black text-slate-900 mt-1">R$ {faturamentoBruto.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                              <span className="text-[10px] text-slate-400 font-semibold block mt-1">Soma de parcelas brutas</span>
+                            </div>
+
+                            <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
+                              <span className="text-[9px] font-extrabold text-slate-400 uppercase tracking-wider block">Quantidade de Pedidos</span>
+                              <p className="text-xl font-black text-slate-900 mt-1">{totalPedidosCount}</p>
+                              <span className="text-[10px] text-slate-400 font-semibold block mt-1">
+                                <span className="text-emerald-600 font-bold">{entreguesCount}</span> entregues • <span className="text-amber-600 font-bold">{pendentesCount}</span> ativos • <span className="text-rose-500 font-bold">{canceladosCount}</span> cancelados
+                              </span>
+                            </div>
+
+                            <div className="bg-brand/5 p-5 rounded-3xl border border-brand/20 shadow-xs">
+                              <span className="text-[9px] font-extrabold text-brand uppercase tracking-wider block">Comissão Acumulada</span>
+                              <p className="text-xl font-black text-brand mt-1">R$ {comissaoGerada.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                              <span className="text-[10px] text-slate-500 font-semibold block mt-1">Ganho potencial no período</span>
+                            </div>
+
+                            <div className="bg-emerald-50/[0.1] p-5 rounded-3xl border border-emerald-200 shadow-xs">
+                              <span className="text-[9px] font-extrabold text-emerald-600 uppercase tracking-wider block">Comissão Recebida</span>
+                              <p className="text-xl font-black text-emerald-650 mt-1">R$ {comissaoRecebida.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                              <span className="text-[10px] text-emerald-650 font-semibold block mt-1">Confirmada pago</span>
+                            </div>
+
+                            <div className="bg-amber-50/[0.1] p-5 rounded-3xl border border-[#d97706]/20 shadow-xs">
+                              <span className="text-[9px] font-extrabold text-[#d97706] uppercase tracking-wider block">Comissão Pendente</span>
+                              <p className="text-xl font-black text-[#d97706] mt-1">R$ {comissaoPendente.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                              <span className="text-[10px] text-[#d97706] font-semibold block mt-1 font-mono">Em trânsito / Pendente</span>
+                            </div>
+
+                            <div className="bg-slate-50 p-5 rounded-3xl border border-slate-200 shadow-xs flex flex-col justify-center">
+                              <span className="text-[9px] font-extrabold text-slate-400 uppercase tracking-wider block">Valor Vendido Consolidado</span>
+                              <p className="text-xl font-black text-slate-800 mt-1">R$ {faturamentoBruto.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                            </div>
+                          </div>
+
+                          {/* Quick Actions Excel block */}
+                          <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs space-y-4">
+                            <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-wider">Ações de Exportação Oficial</h4>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              <button
+                                onClick={exportExcelFiltered}
+                                className="bg-indigo-650 hover:bg-indigo-700 text-white py-3 px-5 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer shadow-xs border border-indigo-700"
+                              >
+                                <FileSpreadsheet className="w-4 h-4" />
+                                Exportar Relatório com Filtros (.XLSX)
+                              </button>
+                              <button
+                                onClick={exportCityReport}
+                                className="bg-slate-900 hover:bg-slate-800 text-white py-3 px-5 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer shadow-xs border border-slate-950"
+                              >
+                                <Database className="w-4 h-4 text-brand" />
+                                Exportar Relatório de Cidades (.XLSX)
+                              </button>
+                            </div>
+                            <p className="text-[10px] text-slate-400">O Relatório de Cidades gera uma listagem consolidada contendo Cidade, Quantidade de Vendas, Faturamento Gerado, e Comissão acumulada, ordenada de forma decrescente pela quantidade de vendas.</p>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (activeTab === 'weekSummary') {
+                      // Rule 9: General weekly summary comparing all suppliers
+                      const summary = getSupplierResumo(reportsPeriodFilter, reportsStartDate, reportsEndDate);
+                      return (
+                        <div className="space-y-6">
+                          <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
+                            <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-wider mb-4 block">Resumos Semanais por Fornecedor</h4>
+                            <div className="space-y-3.5">
+                              {summary.list.map(item => (
+                                <div key={item.label} className="bg-slate-50 border border-slate-200/80 p-4 rounded-2xl grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-center">
+                                  <span className="text-xs font-black text-slate-800">{item.label}</span>
+                                  <div>
+                                    <span className="text-[9px] text-slate-450 uppercase font-extrabold block">Faturamento</span>
+                                    <span className="text-xs font-bold text-slate-700">R$ {item.faturamento.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                  </div>
+                                  <div>
+                                    <span className="text-[9px] text-indigo-600 uppercase font-extrabold block">Comissão Acumulada</span>
+                                    <span className="text-xs font-black text-brand">R$ {item.comissao.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Grand Total Footer Panel */}
+                          <div className="bg-[#0f172a] text-white p-5 rounded-3xl flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                            <div>
+                              <span className="text-[10px] text-slate-400 uppercase font-black tracking-widest block">Consolidação de Todos Fornecedores</span>
+                              <h3 className="text-xs font-bold text-slate-300 mt-0.5">Visão unificada agregada de faturamento e comissões do canal</h3>
+                            </div>
+                            <div className="flex gap-6">
+                              <div>
+                                <span className="text-[9px] text-slate-400 block uppercase font-bold">Faturamento Total</span>
+                                <span className="text-lg font-black text-white">R$ {summary.totalGeralFaturamento.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                              </div>
+                              <div>
+                                <span className="text-[9px] text-brand block uppercase font-bold">Comissão Total</span>
+                                <span className="text-lg font-black text-brand">R$ {summary.totalGeralComissao.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (activeTab === 'financeAudit') {
+                      const auditValidOrders = filteredPedidosForReport.filter(o => o.status !== 'CANCELLED');
+                      const auditCalculatedSalesTotal = auditValidOrders.reduce((sum, o) => sum + (o.valorTotal || 0), 0);
+                      const auditCalculatedCommissionTotal = auditValidOrders.reduce((sum, o) => sum + (o.comissao || 0), 0);
+                      const auditQuantityOfOrders = auditValidOrders.length;
+                      
+                      return (
+                        <div className="space-y-6">
+                          <div className="bg-[#0f172a] text-white p-6 rounded-3xl grid grid-cols-1 md:grid-cols-3 gap-6 shadow-md border border-slate-800">
+                            <div>
+                              <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest block">Total de Vendas Calculado</span>
+                              <p className="text-2xl font-black mt-1">
+                                R$ {auditCalculatedSalesTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </p>
+                              <span className="text-[9px] text-slate-500 mt-1 block">Apenas vendas válidas (não canceladas)</span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-brand font-extrabold uppercase tracking-widest block">Total de Comissão Calculado</span>
+                              <p className="text-2xl font-black text-brand mt-1">
+                                R$ {auditCalculatedCommissionTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </p>
+                              <span className="text-[9px] text-slate-500 mt-1 block">Soma de comissões (não canceladas)</span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-emerald-400 font-extrabold uppercase tracking-widest block">Pedidos Considerados</span>
+                              <p className="text-2xl font-black text-emerald-400 mt-1">
+                                {auditQuantityOfOrders} <span className="text-xs font-semibold text-slate-400">pedidos</span>
+                              </p>
+                              <span className="text-[9px] text-slate-500 mt-1 block">Exclui cancelados & deletados</span>
+                            </div>
+                          </div>
+
+                          <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-xs">
+                            <div className="p-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                              <div>
+                                <h4 className="text-sm font-extrabold text-slate-800">Auditoria Financeira Completa dos Pedidos</h4>
+                                <p className="text-xs text-slate-400 mt-0.5 font-medium">Controle de conformidade individual das vendas e comissões do canal.</p>
+                              </div>
+                              <span className="text-[10px] font-bold px-3 py-1 bg-amber-50 text-amber-800 border border-amber-200/60 rounded-full">
+                                Auditoria Ativa
+                              </span>
+                            </div>
+
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-left text-xs">
+                                <thead className="bg-[#f8fafc] text-slate-500 font-bold border-b border-slate-200/80">
+                                  <tr>
+                                    <th className="px-4 py-3 font-semibold">ID do Pedido</th>
+                                    <th className="px-4 py-3 font-semibold">Fornecedor</th>
+                                    <th className="px-4 py-3 font-semibold">Status</th>
+                                    <th className="px-4 py-3 font-semibold">Valor da Venda</th>
+                                    <th className="px-4 py-3 font-semibold">Comissão</th>
+                                    <th className="px-4 py-3 font-semibold">Cidade</th>
+                                    <th className="px-2 py-3 font-semibold text-center">Impacto</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-150">
+                                  {filteredPedidosForReport.length === 0 ? (
+                                    <tr>
+                                      <td colSpan={7} className="px-4 py-10 text-center text-slate-400 font-medium">
+                                        Nenhum pedido encontrado nos filtros selecionados.
+                                      </td>
+                                    </tr>
+                                  ) : (
+                                    filteredPedidosForReport.map((o) => {
+                                      const isCancelled = o.status === 'CANCELLED';
+                                      return (
+                                        <tr key={o.id} className={`hover:bg-slate-50/50 transition-colors ${isCancelled ? 'bg-rose-50/20 text-slate-400' : ''}`}>
+                                          <td className="px-4 py-3.5 font-mono text-[10px] select-all max-w-[120px] truncate" title={o.id}>
+                                            {o.id || 'N/A'}
+                                          </td>
+                                          <td className="px-4 py-3.5 font-semibold text-slate-700">
+                                            {getSupplierNameByKey(o.supplier)}
+                                          </td>
+                                          <td className="px-4 py-3.5">
+                                            <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                                              o.status === 'DELIVERED' ? 'bg-emerald-50 text-emerald-700 border border-emerald-250' :
+                                              o.status === 'CANCELLED' ? 'bg-rose-50 text-rose-700 border border-rose-200' :
+                                              'bg-amber-50 text-amber-700 border border-amber-200'
+                                            }`}>
+                                              {o.status === 'PENDING' ? 'Pendente' :
+                                               o.status === 'DELIVERED' ? 'Entregue' :
+                                               o.status === 'DELIVERED_UNPAID' ? 'Entregue / Não Pago' :
+                                               o.status === 'RESCHEDULED' ? 'Reagendado' :
+                                               o.status === 'CANCELLED' ? 'Cancelado' : o.status}
+                                            </span>
+                                          </td>
+                                          <td className="px-4 py-3.5 font-bold text-slate-800">
+                                            R$ {(o.valorTotal || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                          </td>
+                                          <td className="px-4 py-3.5 font-bold text-indigo-600">
+                                            R$ {(o.comissao || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                          </td>
+                                          <td className="px-4 py-3.5 text-slate-600 font-medium">
+                                            {o.city || 'Não informada'}
+                                          </td>
+                                          <td className="px-2 py-3.5 text-center">
+                                            {isCancelled ? (
+                                              <span className="text-[10px] font-bold text-rose-500 py-0.5 px-1.5 bg-rose-50 rounded-sm">
+                                                DESCARTADO
+                                              </span>
+                                            ) : (
+                                              <span className="text-[10px] font-bold text-emerald-600 py-0.5 px-1.5 bg-emerald-50 rounded-sm">
+                                                SOMADO
+                                              </span>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (activeTab === 'snapshots') {
+                      // Rule 6, 7: Weekly histories snapshots
+                      return (
+                        <div className="space-y-4">
+                          <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
+                            <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-wider block mb-1">Histórico de Fechamento de Semanas</h4>
+                            <p className="text-[10px] text-slate-450 font-medium mb-4 block">Captura de instantâneo automática (snapshots) gerados ao fim das semanas correntes</p>
+                            
+                            {weeklySnapshots.length === 0 ? (
+                              <div className="p-12 text-center bg-slate-50 border border-dashed border-slate-200 rounded-3xl text-sm font-semibold text-slate-500">
+                                Nenhum instantâneo de histórico semanal gerado ainda. Snapshots são criados automaticamente a cada final de ciclo de semana de forma de banco persistente.
+                              </div>
+                            ) : (
+                              <div className="space-y-4.5 max-h-[45vh] overflow-y-auto pr-1">
+                                {weeklySnapshots.map(snap => (
+                                  <div key={snap.id} className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs grid grid-cols-1 md:grid-cols-4 gap-3 items-center text-left">
+                                    <div className="space-y-1">
+                                      <span className="bg-slate-100 text-slate-700 border border-slate-200 text-[9px] font-black tracking-widest px-2.5 py-0.5 rounded-full inline-block">
+                                        Período
+                                      </span>
+                                      <h5 className="text-xs font-bold text-slate-800">{snap.startDate} - {snap.endDate}</h5>
+                                      <p className="text-[9px] font-bold text-slate-500">{snap.fornecedor}</p>
+                                    </div>
+                                    <div>
+                                      <span className="text-[9px] text-slate-400 font-bold block uppercase">Faturamento</span>
+                                      <span className="text-xs font-bold text-slate-800">R$ {(snap.faturamento || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                                    </div>
+                                    <div className="space-y-1">
+                                      <div>
+                                        <span className="text-[9px] text-emerald-600 block uppercase font-bold">Comissão Recebida</span>
+                                        <span className="text-xs font-bold text-emerald-600">R$ {(snap.comissaoRecebida || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-[9px] text-amber-600 block uppercase font-bold">Comissão Pendente</span>
+                                        <span className="text-[10px] text-amber-600 font-semibold">R$ {(snap.comissaoPendente || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                                      </div>
+                                    </div>
+                                    <div className="bg-slate-50 p-2.5 rounded-xl text-center">
+                                      <span className="text-[9px] text-slate-500 block uppercase font-bold mb-1">Status Pedidos</span>
+                                      <div className="flex justify-center gap-2.5">
+                                        <div className="text-center">
+                                          <span className="text-[9px] text-slate-400 block label font-mono">Entreg</span>
+                                          <span className="text-xxs block font-bold text-emerald-600">{snap.pedidosEntregues || 0}</span>
+                                        </div>
+                                        <div className="text-center">
+                                          <span className="text-[9px] text-slate-400 block label font-mono">Pend</span>
+                                          <span className="text-xxs block font-bold text-amber-500">{snap.pedidosPendentes || 0}</span>
+                                        </div>
+                                        <div className="text-center">
+                                          <span className="text-[9px] text-slate-400 block label font-mono font-mono">Canc</span>
+                                          <span className="text-xxs block font-bold text-rose-500">{snap.pedidosCancelados || 0}</span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (activeTab === 'logs') {
+                      // Rule 10: Commission audit changes log
+                      return (
+                        <div className="space-y-4">
+                          <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
+                            <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-wider block mb-1 font-sans">Log de Alteração de Comissões</h4>
+                            <p className="text-[10px] text-slate-450 font-medium mb-4 block">Histórico persistente e imutável de todas as modificações financeiras efetuadas no canal</p>
+
+                            {commissionLogHistory.length === 0 ? (
+                              <div className="p-12 text-center bg-slate-50 border border-dashed border-slate-200 rounded-3xl text-sm font-semibold text-slate-500">
+                                Nenhuma alteração financeira de comissão foi registrada no sistema até o momento.
+                              </div>
+                            ) : (
+                              <div className="max-h-[45vh] overflow-y-auto pr-1">
+                                <table className="w-full text-xs text-left border-collapse">
+                                  <thead>
+                                    <tr className="border-b border-slate-200 text-slate-500 font-extrabold uppercase text-[8px] bg-slate-50">
+                                      <th className="py-2.5 px-3 font-sans">Data/Hora</th>
+                                      <th className="py-2.5 px-3 font-sans">Pedido</th>
+                                      <th className="py-2.5 px-3 font-sans">Cliente</th>
+                                      <th className="py-2.5 px-3 font-sans">Fornecedor</th>
+                                      <th className="py-2.5 px-3 text-right font-sans">Anterior</th>
+                                      <th className="py-2.5 px-3 text-right font-sans">Novo Valor</th>
+                                      <th className="py-2.5 px-3 text-right font-sans">Operador</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {commissionLogHistory.map(log => (
+                                      <tr key={log.id} className="border-b border-slate-100 hover:bg-slate-50/55 transition text-slate-700">
+                                        <td className="py-2.5 px-3 font-mono text-[10px] text-slate-400">{log.timestamp}</td>
+                                        <td className="py-2.5 px-3 font-semibold text-[11px] text-slate-800 font-mono">#{log.numeroVenda}</td>
+                                        <td className="py-2.5 px-3 truncate max-w-[120px]" title={log.cliente}>{log.cliente}</td>
+                                        <td className="py-2.5 px-3 text-[10px] font-bold text-slate-500">
+                                          {log.fornecedor === 'SOFIA_HOME_DECOR' || log.fornecedor === 'Sofia Home Decor' ? 'Sofia' :
+                                           log.fornecedor === 'MICHAEL' || log.fornecedor === 'Michael' ? 'Michael' :
+                                           log.fornecedor === 'FRANK' || log.fornecedor === 'Frank' ? 'Frank' : 'Outros'}
+                                        </td>
+                                        <td className="py-2.5 px-3 text-right font-semibold text-slate-400">R$ {(log.valorAnterior || 0).toFixed(2)}</td>
+                                        <td className="py-2.5 px-3 text-right font-bold text-brand">R$ {(log.valorNovo || 0).toFixed(2)}</td>
+                                        <td className="py-2.5 px-3 text-right text-slate-500 text-[10px] font-bold">{log.alteradoPor}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    return null;
+                  })()}
                 </div>
 
                 {/* Footer and exit buttons */}
-                <div className="px-6 py-4 bg-slate-50 border-t border-slate-150 flex items-center justify-end gap-2">
-                  <button
-                    onClick={() => {
-                      const textSummary = `*RELATÓRIO DE DESEMPENHO IA ZAP REGISTRO*\n\nPeríodo: ${rep.periodo}\nPedidos Convertidos: ${rep.vendasCount}\nFaturamento Bruto: R$ ${rep.faturamento.toFixed(2)}\nComissão Gerada: R$ ${rep.comissaoGerada.toFixed(2)}\nComissão Liquidada: R$ ${rep.comissaoRecebida.toFixed(2)}`;
-                      navigator.clipboard.writeText(textSummary);
-                      triggerToast('success', 'Relatório copiado para a área de transferência no estilo texto!');
-                    }}
-                    className="bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 text-xs py-2 px-4 rounded-full font-bold flex items-center gap-1 transition cursor-pointer"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    Copiar Relatório Formatado
-                  </button>
+                <div className="px-6 py-4 bg-slate-50 border-t border-slate-200/80 flex items-center justify-between">
+                  <span className="text-[10px] font-bold text-slate-400 font-mono">MD_RELATORIOS v3.0 ACTIVE</span>
                   <button
                     onClick={() => setShowReportsModal(false)}
-                    className="bg-slate-900 hover:bg-slate-800 text-white text-xs py-2 px-5 rounded-full font-bold transition cursor-pointer"
+                    className="bg-slate-900 hover:bg-slate-800 text-white text-xs py-2.5 px-6 rounded-full font-bold transition cursor-pointer"
                   >
-                    Fechar Painel
+                    Fechar Módulo
                   </button>
                 </div>
               </motion.div>

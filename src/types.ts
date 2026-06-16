@@ -20,6 +20,7 @@ export interface Pedido {
   city?: string;
   state?: string;
   supplier?: 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS';
+  tipoRecebimento?: 'TRAFEGO' | 'DINHEIRO';
   userId?: string;
   createdBy?: string;
   updatedBy?: string;

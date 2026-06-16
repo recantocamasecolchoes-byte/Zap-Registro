@@ -433,6 +433,7 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
     textoOriginal: pedido.textoOriginal,
     observacoes: pedido.observacoes,
     supplier: pedido.supplier,
+    tipoRecebimento: pedido.tipoRecebimento,
     updatedAt: isFirebaseConfigured ? serverTimestamp() : Date.now()
   };
 
@@ -507,7 +508,7 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
 export async function updatePedidoStatus(
   id: string, 
   newStatus: any,
-  extra?: { dataReagendamento?: string },
+  extra?: { dataReagendamento?: string; tipoRecebimento?: 'TRAFEGO' | 'DINHEIRO' },
   byUser?: string,
   supplier?: string
 ): Promise<void> {
@@ -551,9 +552,14 @@ export async function updatePedidoStatus(
   if (byUser) {
     updatePayload.updatedBy = byUser;
   }
-  if (extra && extra.dataReagendamento !== undefined) {
-    updatePayload.dataReagendamento = extra.dataReagendamento;
-    updatePayload.rescheduleDate = extra.dataReagendamento;
+  if (extra) {
+    if (extra.dataReagendamento !== undefined) {
+      updatePayload.dataReagendamento = extra.dataReagendamento;
+      updatePayload.rescheduleDate = extra.dataReagendamento;
+    }
+    if (extra.tipoRecebimento !== undefined) {
+      updatePayload.tipoRecebimento = extra.tipoRecebimento;
+    }
   }
 
   if (isFirebaseConfigured && db) {
@@ -592,8 +598,13 @@ export async function updatePedidoStatus(
     const idx = list.findIndex(p => p.id === id);
     if (idx !== -1) {
       list[idx].status = fileStatus;
-      if (extra && extra.dataReagendamento !== undefined) {
-        list[idx].dataReagendamento = extra.dataReagendamento;
+      if (extra) {
+        if (extra.dataReagendamento !== undefined) {
+          list[idx].dataReagendamento = extra.dataReagendamento;
+        }
+        if (extra.tipoRecebimento !== undefined) {
+          list[idx].tipoRecebimento = extra.tipoRecebimento;
+        }
       }
       if (byUser) {
         list[idx].updatedBy = byUser;
