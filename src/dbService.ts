@@ -23,6 +23,53 @@ export function getCollectionNameBySupplier(supplier?: string): string {
   return 'Outros Fornecedores';
 }
 
+export function isSofiaHomeDecor(supplier?: string): boolean {
+  if (!supplier) return false;
+  const s = supplier.toUpperCase().trim();
+  return s === 'SOFIA_HOME_DECOR' || s === 'SOFIA HOME DECOR' || s === 'SOFIA';
+}
+
+export function removeUndefinedFields<T = any>(obj: T): T {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (obj instanceof Date || (obj.constructor && obj.constructor.name.includes('FieldValue'))) {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(item => removeUndefinedFields(item)) as any;
+  }
+  const result: any = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== undefined && key !== 'tipoRecebimento') {
+      if (value !== null && typeof value === 'object') {
+        result[key] = removeUndefinedFields(value);
+      } else {
+        result[key] = value;
+      }
+    }
+  }
+  return result;
+}
+
+export const cleanUndefinedFields = removeUndefinedFields;
+
+export function normalizeFormaPagamento(value: string | undefined | null): 'À Vista' | 'Parcelado' {
+  if (!value) return 'À Vista';
+  const val = value.trim().toUpperCase();
+  if (
+    val.includes('PARC') || 
+    val.includes('VEZES') || 
+    val.includes('CARTAO') || 
+    val.includes('CARTÃO') || 
+    val.includes('CRE') || 
+    val.includes('PRAZO') || 
+    val.includes('X') ||
+    val.includes('PARCELADO')
+  ) {
+    return 'Parcelado';
+  }
+  return 'À Vista';
+}
+
 // LocalStorage storage and sync for Custom Users
 let currentOfflineUsers: CustomUser[] = [];
 export const DEFAULT_SYSTEM_USERS: CustomUser[] = [
@@ -93,10 +140,10 @@ export async function seedInitialUsersIfEmpty(): Promise<void> {
         for (const user of DEFAULT_SYSTEM_USERS) {
           const docId = user.id || `user-${user.username}`;
           const { id, ...payload } = user;
-          await setDoc(doc(db, "users", docId), {
+          await setDoc(doc(db, "users", docId), removeUndefinedFields({
             ...payload,
             createdAt: serverTimestamp()
-          });
+          }));
         }
         console.log("Seeding complete.");
       }
@@ -121,7 +168,7 @@ const INITIAL_MOCK_PEDIDOS: Pedido[] = [
     produto: "Cama Box Casal King",
     cor: "Preto",
     quantidade: 1,
-    formaPagamento: "PIX",
+    formaPagamento: "À Vista",
     valorTotal: 1599.00,
     comissao: 160.00,
     status: "PENDING",
@@ -139,7 +186,7 @@ const INITIAL_MOCK_PEDIDOS: Pedido[] = [
     produto: "Sofá Retrátil 3 Lugares",
     cor: "Cinza Chumbo",
     quantidade: 1,
-    formaPagamento: "Cartão de Crédito",
+    formaPagamento: "Parcelado",
     valorTotal: 2400.00,
     comissao: 240.00,
     status: "RESCHEDULED",
@@ -157,7 +204,7 @@ const INITIAL_MOCK_PEDIDOS: Pedido[] = [
     produto: "Mesa de Jantar 6 Cadeiras",
     cor: "Mel e Off-White",
     quantidade: 1,
-    formaPagamento: "Dinheiro / Entregar no local",
+    formaPagamento: "À Vista",
     valorTotal: 1850.00,
     comissao: 185.00,
     status: "DELIVERED",
@@ -274,7 +321,7 @@ export function subscribePedidos(
             produto: d.produto || '',
             cor: d.cor || '',
             quantidade: d.quantidade || 1,
-            formaPagamento: d.formaPagamento || '',
+            formaPagamento: normalizeFormaPagamento(d.formaPagamento),
             valorTotal: typeof d.valorTotal === "number" ? d.valorTotal : parseFloat(d.valorTotal) || 0,
             comissao: typeof d.comissao === "number" ? d.comissao : parseFloat(d.comissao) || 0,
             status: mappedStatus,
@@ -350,25 +397,29 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
            norm.includes("retirada no local");
   };
 
-  const matchesRetirada = 
-    isRetiradaText(cityInput) || 
-    isRetiradaText(pedido.endereco || '') || 
-    isRetiradaText(pedido.observacoes || '') || 
-    isRetiradaText(pedido.textoOriginal || '');
-
-  if (matchesRetirada) {
-    cityInput = "RETIRADA";
+  if (isRetiradaText(cityInput)) {
+    cityInput = "Retirada";
     stateInput = "";
-  } else if (!cityInput) {
-    // If not found in cityInput, let's check if endereco contains a city/state format like "Alfenas/MG" or "Alfenas - MG"
-    const addr = pedido.endereco || '';
-    const match = addr.match(/,\s*([^,]+?)\s*[\/-]\s*([A-Za-z]{2})/);
-    if (match) {
-      cityInput = match[1].trim();
-      stateInput = match[2].trim().toUpperCase();
-      if (isRetiradaText(cityInput)) {
-        cityInput = "RETIRADA";
-        stateInput = "";
+  } else if (!cityInput || cityInput === "NÃO INFORMADO") {
+    const matchesRetirada = 
+      isRetiradaText(pedido.endereco || '') || 
+      isRetiradaText(pedido.observacoes || '') || 
+      isRetiradaText(pedido.textoOriginal || '');
+
+    if (matchesRetirada) {
+      cityInput = "Retirada";
+      stateInput = "";
+    } else {
+      // If not found in cityInput, let's check if endereco contains a city/state format like "Alfenas/MG" or "Alfenas - MG"
+      const addr = pedido.endereco || '';
+      const match = addr.match(/,\s*([^,]+?)\s*[\/-]\s*([A-Za-z]{2})/);
+      if (match) {
+        cityInput = match[1].trim();
+        stateInput = match[2].trim().toUpperCase();
+        if (isRetiradaText(cityInput)) {
+          cityInput = "Retirada";
+          stateInput = "";
+        }
       }
     }
   }
@@ -400,8 +451,8 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
     }
   }
 
-  // Capitalize first letters of city unless it is RETIRADA or NÃO INFORMADO
-  if (cityInput && cityInput !== "RETIRADA" && cityInput !== "NÃO INFORMADO") {
+  // Capitalize first letters of city unless it is Retirada or NÃO INFORMADO
+  if (cityInput && cityInput.toLowerCase() !== "retirada" && cityInput !== "NÃO INFORMADO") {
     cityInput = cityInput
       .split(' ')
       .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
@@ -413,27 +464,26 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
   }
 
   const payload: any = {
-    numeroVenda: pedido.numeroVenda,
-    data: pedido.data,
-    nomeCompleto: pedido.nomeCompleto,
-    telefone1: pedido.telefone1,
-    telefone2: pedido.telefone2,
-    endereco: pedido.endereco,
+    numeroVenda: pedido.numeroVenda || '',
+    data: pedido.data || '',
+    nomeCompleto: pedido.nomeCompleto || '',
+    telefone1: pedido.telefone1 || '',
+    telefone2: pedido.telefone2 || '',
+    endereco: pedido.endereco || '',
     city: cityInput,
-    state: stateInput,
-    produto: pedido.produto,
-    cor: pedido.cor,
+    state: stateInput || '',
+    produto: pedido.produto || '',
+    cor: pedido.cor || '',
     quantidade: Number(pedido.quantidade) || 1,
-    formaPagamento: pedido.formaPagamento,
+    formaPagamento: normalizeFormaPagamento(pedido.formaPagamento),
     valorTotal: Number(pedido.valorTotal) || 0,
     comissao: Number(pedido.comissao) || 0,
     status: mappedStatus,
     dataReagendamento: pedido.dataReagendamento || '',
     rescheduleDate: pedido.rescheduleDate || pedido.dataReagendamento || '',
-    textoOriginal: pedido.textoOriginal,
-    observacoes: pedido.observacoes,
+    textoOriginal: pedido.textoOriginal || '',
+    observacoes: pedido.observacoes || '',
     supplier: pedido.supplier,
-    tipoRecebimento: pedido.tipoRecebimento,
     updatedAt: isFirebaseConfigured ? serverTimestamp() : Date.now()
   };
 
@@ -457,7 +507,9 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
     try {
       if (pedido.id) {
         const docRef = doc(db, targetColName, pedido.id);
-        await setDoc(docRef, payload, { merge: true });
+        const cleanedPayload = removeUndefinedFields(payload);
+        console.log("Objeto enviado:", cleanedPayload);
+        await setDoc(docRef, cleanedPayload, { merge: true });
 
         // Cleanup potential duplicate of this ID in other active databases to prevent cross-supplier duplicates
         for (const otherCol of collectionsToClean) {
@@ -472,7 +524,9 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
       } else {
         payload.createdAt = serverTimestamp();
         const colRef = collection(db, targetColName);
-        const docRef = await addDoc(colRef, payload);
+        const cleanedPayload = removeUndefinedFields(payload);
+        console.log("Objeto enviado:", cleanedPayload);
+        const docRef = await addDoc(colRef, cleanedPayload);
         return docRef.id;
       }
     } catch (err: any) {
@@ -508,7 +562,7 @@ export async function savePedido(pedido: Omit<Pedido, "id"> & { id?: string }, b
 export async function updatePedidoStatus(
   id: string, 
   newStatus: any,
-  extra?: { dataReagendamento?: string; tipoRecebimento?: 'TRAFEGO' | 'DINHEIRO' },
+  extra?: { dataReagendamento?: string; formaPagamento?: 'À Vista' | 'Parcelado' },
   byUser?: string,
   supplier?: string
 ): Promise<void> {
@@ -557,24 +611,25 @@ export async function updatePedidoStatus(
       updatePayload.dataReagendamento = extra.dataReagendamento;
       updatePayload.rescheduleDate = extra.dataReagendamento;
     }
-    if (extra.tipoRecebimento !== undefined) {
-      updatePayload.tipoRecebimento = extra.tipoRecebimento;
+    if (extra.formaPagamento !== undefined) {
+      updatePayload.formaPagamento = extra.formaPagamento;
     }
   }
 
   if (isFirebaseConfigured && db) {
     try {
       const allCollections = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
+      const cleanedPayload = removeUndefinedFields(updatePayload);
       if (supplier) {
         const docRef = doc(db, getCollectionNameBySupplier(supplier), id);
-        await updateDoc(docRef, updatePayload);
+        await updateDoc(docRef, cleanedPayload);
       } else {
         // Try to update document in any of the four collections sequentially
         let updatedAny = false;
         for (const col of allCollections) {
           try {
             const docRef = doc(db, col, id);
-            await updateDoc(docRef, updatePayload);
+            await updateDoc(docRef, cleanedPayload);
             updatedAny = true;
             break;
           } catch (e) {
@@ -585,9 +640,9 @@ export async function updatePedidoStatus(
           console.warn(`[updatePedidoStatus] Could not locate document ${id} with status update in any collection.`);
         }
       }
-      console.log("Status atualizado com sucesso no Firestore:", id, "com", fileStatus);
+      console.log("Status updated with success on Firestore:", id, "with", fileStatus);
     } catch (error: any) {
-      console.error("ERRO FIREBASE DETALHADO:");
+      console.error("DETAILED FIREBASE ERROR:");
       console.error("Error Code:", error?.code);
       console.error("Error Message:", error?.message);
       console.error(error);
@@ -602,8 +657,8 @@ export async function updatePedidoStatus(
         if (extra.dataReagendamento !== undefined) {
           list[idx].dataReagendamento = extra.dataReagendamento;
         }
-        if (extra.tipoRecebimento !== undefined) {
-          list[idx].tipoRecebimento = extra.tipoRecebimento;
+        if (extra.formaPagamento !== undefined) {
+          list[idx].formaPagamento = extra.formaPagamento;
         }
       }
       if (byUser) {
@@ -721,7 +776,7 @@ export async function saveBackupMetadata(backup: Omit<BackupItem, "id">): Promis
   if (isFirebaseConfigured && db) {
     try {
       const docRef = doc(db, "system_backups", finalId);
-      await setDoc(docRef, payload);
+      await setDoc(docRef, removeUndefinedFields(payload));
       
       // Auto prune: keep only last 30 automated backups
       if (backup.backupType === 'automatico') {
@@ -871,7 +926,7 @@ export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<
           produto: p.produto || '',
           cor: p.cor || '',
           quantidade: Number(p.quantidade) || 1,
-          formaPagamento: p.formaPagamento || '',
+          formaPagamento: normalizeFormaPagamento(p.formaPagamento),
           valorTotal: Number(p.valorTotal) || 0,
           comissao: Number(p.comissao) || 0,
           status: fileStatus,
@@ -889,7 +944,7 @@ export async function restoreBackupToSystem(restoredPedidos: Pedido[]): Promise<
           payload.createdAt = serverTimestamp();
         }
         
-        await setDoc(docRef, payload, { merge: true });
+        await setDoc(docRef, removeUndefinedFields(payload), { merge: true });
         
         // Cleanup document from other collections just in case of cross-supplier restore cleanups
         const allCollections = ["Sofia Home Decor", "Michael", "Frank", "Outros Fornecedores"];
@@ -1027,7 +1082,7 @@ export async function excludeOrderWithBackup(
     try {
       console.log("[DEBUG excludeOrderWithBackup] Salvando backup no Firestore na coleção 'system_exclusions', ID:", finalId);
       const exclusionDocRef = doc(db, "system_exclusions", finalId);
-      await setDoc(exclusionDocRef, payload);
+      await setDoc(exclusionDocRef, removeUndefinedFields(payload));
       console.log("[DEBUG excludeOrderWithBackup] Backup de exclusão salvo com sucesso no Firestore.");
     } catch (err: any) {
       console.error("[DEBUG excludeOrderWithBackup] Erro ao gravar backup de exclusão no Firestore:", err);
@@ -1144,7 +1199,7 @@ export async function saveCustomUser(user: CustomUser): Promise<string> {
     try {
       const userId = user.id || `user-${payload.username}`;
       const docRef = doc(db, "users", userId);
-      await setDoc(docRef, payload, { merge: true });
+      await setDoc(docRef, removeUndefinedFields(payload), { merge: true });
       return userId;
     } catch (err: any) {
       handleFirestoreError(err, user.id ? OperationType.UPDATE : OperationType.CREATE, `users/${user.id || 'new'}`);

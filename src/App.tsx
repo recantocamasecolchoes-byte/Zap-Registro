@@ -75,7 +75,9 @@ import {
   seedInitialUsersIfEmpty,
   subscribeUsers,
   saveCustomUser,
-  deleteCustomUser
+  deleteCustomUser,
+  cleanUndefinedFields,
+  removeUndefinedFields
 } from './dbService';
 import * as XLSX from 'xlsx';
 import { 
@@ -249,8 +251,8 @@ export default function App() {
   // Sofia payment confirmation state (Rule 3)
   const [sofiaPaymentModalOpen, setSofiaPaymentModalOpen] = useState<boolean>(false);
   const [sofiaPaymentOrderId, setSofiaPaymentOrderId] = useState<string | null>(null);
-  const [sofiaPaymentType, setSofiaPaymentType] = useState<'TRAFEGO' | 'DINHEIRO' | null>(null);
-  const [sofiaPaymentExtra, setSofiaPaymentExtra] = useState<{ newStatus: any; extra?: { dataReagendamento?: string } } | null>(null);
+  const [sofiaPaymentType, setSofiaPaymentType] = useState<'À Vista' | 'Parcelado' | null>(null);
+  const [sofiaPaymentExtra, setSofiaPaymentExtra] = useState<{ newStatus: any; extra?: { dataReagendamento?: string; formaPagamento?: 'À Vista' | 'Parcelado' } } | null>(null);
 
   // States for Backup and security system
   const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
@@ -321,7 +323,7 @@ export default function App() {
         return saved;
       }
     }
-    return 'SOFIA_HOME_DECOR';
+    return 'MICHAEL';
   });
 
   // Mandatory Supplier Selection starts empty to avoid defaulting to Sofia Home Decor by default
@@ -692,10 +694,10 @@ export default function App() {
       const weekId = `${startDate.substring(0, 5)}-${endDate.substring(0, 5)}`; // e.g. "08/06-14/06"
       
       const suppliers: { id: string; label: string }[] = [
-        { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' },
         { id: 'MICHAEL', label: 'Michael' },
         { id: 'FRANK', label: 'Frank' },
-        { id: 'OUTROS', label: 'Outros Fornecedores' }
+        { id: 'OUTROS', label: 'Outros Fornecedores' },
+        { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' }
       ];
 
       for (const supplier of suppliers) {
@@ -763,7 +765,7 @@ export default function App() {
         };
 
         if (isFirebaseConfigured && db) {
-          await setDoc(doc(db, "weekly_snapshots", docId), snapshotPayload);
+          await setDoc(doc(db, "weekly_snapshots", docId), removeUndefinedFields(snapshotPayload));
         } else {
           const localSnapshots = localStorage.getItem("iazap_weekly_snapshots") || "[]";
           const parsed = JSON.parse(localSnapshots);
@@ -791,7 +793,7 @@ export default function App() {
       };
 
       if (isFirebaseConfigured && db) {
-        await addDoc(collection(db, "commission_changes_history"), changeLog);
+        await addDoc(collection(db, "commission_changes_history"), removeUndefinedFields(changeLog));
       } else {
         const localLogs = localStorage.getItem("iazap_commission_changes_history") || "[]";
         const parsed = JSON.parse(localLogs);
@@ -806,10 +808,10 @@ export default function App() {
 
   const getSupplierResumo = (selectedPeriod: string, customStart?: string, customEnd?: string) => {
     const suppliers = [
-      { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' },
       { id: 'MICHAEL', label: 'Michael' },
       { id: 'FRANK', label: 'Frank' },
-      { id: 'OUTROS', label: 'Outros Fornecedores' }
+      { id: 'OUTROS', label: 'Outros Fornecedores' },
+      { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' }
     ];
 
     let totalGeralFaturamento = 0;
@@ -1348,7 +1350,7 @@ export default function App() {
         produto: produto,
         cor: finalCor,
         quantidade: 1,
-        formaPagamento: formaPagamento,
+        formaPagamento: normalizeFormaPagamento(formaPagamento),
         valorTotal: valorTotal,
         comissaoSugerida: 0,
         observacoes: finalObsStr.trim() || "Extraído via Sofia Home Decor",
@@ -1581,7 +1583,7 @@ export default function App() {
         produto: produto,
         cor: cor,
         quantidade: quantidade,
-        formaPagamento: formaPagamento,
+        formaPagamento: normalizeFormaPagamento(formaPagamento),
         valorTotal: valorTotal,
         comissaoSugerida: comissaoSugerida,
         observacoes: observacoes || "Extraído via Parser Padrão Local",
@@ -1790,7 +1792,7 @@ export default function App() {
         produto: editingPedido.produto,
         cor: editingPedido.cor || '',
         quantidade: Number(editingPedido.quantidade) || 1,
-        formaPagamento: editingPedido.formaPagamento || '',
+        formaPagamento: normalizeFormaPagamento(editingPedido.formaPagamento),
         valorTotal: Number(editingPedido.valorTotal),
         comissao: Number(editingPedido.comissao),
         status: editingPedido.status || 'PENDING',
@@ -1837,13 +1839,13 @@ export default function App() {
 
 
   // Fast manually trigger status update without AI
-  const handleQuickStatusUpdate = async (id: string, newStatus: any, extra?: { dataReagendamento?: string; tipoRecebimento?: 'TRAFEGO' | 'DINHEIRO' }) => {
+  const handleQuickStatusUpdate = async (id: string, newStatus: any, extra?: { dataReagendamento?: string; formaPagamento?: 'À Vista' | 'Parcelado' }) => {
     const updated = pedidos.find(p => p.id === id);
     if (!updated) return;
 
     // Check Sofia Home Decor Rule (Rule 3)
     const isSofia = (updated.supplier || 'SOFIA_HOME_DECOR') === 'SOFIA_HOME_DECOR' || updated.supplier === 'Sofia Home Decor';
-    if ((newStatus === 'DELIVERED' || newStatus === 'Entregue') && isSofia && (!extra || !extra.tipoRecebimento)) {
+    if ((newStatus === 'DELIVERED' || newStatus === 'Entregue') && isSofia && (!extra || !extra.formaPagamento)) {
       setSofiaPaymentOrderId(id);
       setSofiaPaymentType(null); // Reset selection
       setSofiaPaymentExtra({ newStatus, extra });
@@ -2782,10 +2784,10 @@ export default function App() {
             <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 shrink-0">Fornecedor:</span>
             <div className="flex overflow-x-auto gap-1.5 no-scrollbar scroll-smooth pb-1 sm:pb-0">
               {[
-                { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' },
                 { id: 'MICHAEL', label: 'Michael' },
                 { id: 'FRANK', label: 'Frank' },
-                { id: 'OUTROS', label: 'Outros Fornecedores' }
+                { id: 'OUTROS', label: 'Outros Fornecedores' },
+                { id: 'SOFIA_HOME_DECOR', label: 'Sofia Home Decor' }
               ].map((sup) => {
                 const count = pedidos.filter(p => (p.supplier || 'SOFIA_HOME_DECOR') === sup.id).length;
                 const isActive = currentSupplier === sup.id;
@@ -2875,10 +2877,10 @@ export default function App() {
                     className="w-full text-xs font-bold bg-white p-2.5 text-slate-800 border border-slate-200 focus:border-brand focus:ring-1 focus:ring-brand outline-none rounded-xl shadow-xs transition cursor-pointer"
                   >
                     <option value="">-- Selecione o Fornecedor antes de continuar --</option>
-                    <option value="Sofia Home Decor">Sofia Home Decor</option>
                     <option value="Michael">Michael</option>
                     <option value="Frank">Frank</option>
                     <option value="Outros Fornecedores">Outros Fornecedores</option>
+                    <option value="Sofia Home Decor">Sofia Home Decor</option>
                   </select>
                 </div>
 
@@ -3219,10 +3221,10 @@ export default function App() {
                           className="w-full text-xs font-semibold bg-white p-2.5 text-slate-800 border border-slate-200 focus:border-brand focus:ring-1 focus:ring-brand outline-none rounded-xl shadow-xs transition cursor-pointer"
                         >
                           <option value="">-- Escolha o Fornecedor --</option>
-                          <option value="Sofia Home Decor">Sofia Home Decor</option>
                           <option value="Michael">Michael</option>
                           <option value="Frank">Frank</option>
                           <option value="Outros Fornecedores">Outros Fornecedores</option>
+                          <option value="Sofia Home Decor">Sofia Home Decor</option>
                         </select>
                       </div>
 
@@ -3336,7 +3338,7 @@ export default function App() {
                           type="number" 
                           min={1}
                           value={editingPedido.quantidade || 1}
-                          onChange={(e) => setEditingPedido(prev => prev ? { ...prev, quantity: parseInt(e.target.value, 10) || 1 } : null)}
+                          onChange={(e) => setEditingPedido(prev => prev ? { ...prev, quantidade: parseInt(e.target.value, 10) || 1 } : null)}
                           className="w-full text-sm bg-white p-2.5 text-natural-text border border-natural-border-dark rounded-lg focus:ring-2 focus:ring-brand focus:border-transparent outline-none"
                         />
                       </div>
@@ -4748,7 +4750,7 @@ export default function App() {
                       <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wide">Formas de Pagamento</span>
                       <div className="flex items-center gap-1.5 mt-0.5">
                         <CreditCard className="w-4 h-4 text-slate-400" />
-                        <p className="text-sm font-semibold text-slate-800">{selectedPedido.formaPagamento || 'A combinar'}</p>
+                        <p className="text-sm font-semibold text-slate-800">{selectedPedido.formaPagamento || 'À Vista'}</p>
                       </div>
                     </div>
 
@@ -5035,39 +5037,39 @@ export default function App() {
               <div className="space-y-3">
                 <p className="text-xs font-semibold text-slate-700">Como esta venda foi paga?</p>
                 
-                <label className={`flex items-center gap-3 p-3.5 rounded-2xl border cursor-pointer transition ${sofiaPaymentType === 'TRAFEGO' ? 'border-brand bg-brand/[0.04] text-brand-dark' : 'border-slate-200 text-slate-655 hover:bg-slate-50'}`}>
+                <label className={`flex items-center gap-3 p-3.5 rounded-2xl border cursor-pointer transition ${sofiaPaymentType === 'À Vista' ? 'border-brand bg-brand/[0.04] text-brand-dark' : 'border-slate-200 text-slate-655 hover:bg-slate-50'}`}>
                   <input
                     type="radio"
                     name="sofia_payment_type"
-                    value="TRAFEGO"
-                    checked={sofiaPaymentType === 'TRAFEGO'}
-                    onChange={() => setSofiaPaymentType('TRAFEGO')}
+                    value="À Vista"
+                    checked={sofiaPaymentType === 'À Vista'}
+                    onChange={() => setSofiaPaymentType('À Vista')}
                     className="sr-only"
                   />
-                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${sofiaPaymentType === 'TRAFEGO' ? 'border-brand bg-brand' : 'border-slate-300'}`}>
-                    {sofiaPaymentType === 'TRAFEGO' && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${sofiaPaymentType === 'À Vista' ? 'border-brand bg-brand' : 'border-slate-300'}`}>
+                    {sofiaPaymentType === 'À Vista' && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
                   </div>
                   <div>
-                    <span className="text-xs font-bold block">Descontado no Tráfego</span>
-                    <span className="text-[10px] text-slate-400 block font-medium">Lançado como créditos para campanhas</span>
+                    <span className="text-xs font-bold block">À Vista</span>
+                    <span className="text-[10px] text-slate-400 block font-medium">Pagamento em parcela única / PIX / Dinheiro</span>
                   </div>
                 </label>
 
-                <label className={`flex items-center gap-3 p-3.5 rounded-2xl border cursor-pointer transition ${sofiaPaymentType === 'DINHEIRO' ? 'border-emerald-500 bg-emerald-50/[0.1] text-emerald-850' : 'border-slate-200 text-slate-655 hover:bg-slate-50'}`}>
+                <label className={`flex items-center gap-3 p-3.5 rounded-2xl border cursor-pointer transition ${sofiaPaymentType === 'Parcelado' ? 'border-emerald-500 bg-emerald-50/[0.1] text-emerald-850' : 'border-slate-200 text-slate-655 hover:bg-slate-50'}`}>
                   <input
                     type="radio"
                     name="sofia_payment_type"
-                    value="DINHEIRO"
-                    checked={sofiaPaymentType === 'DINHEIRO'}
-                    onChange={() => setSofiaPaymentType('DINHEIRO')}
+                    value="Parcelado"
+                    checked={sofiaPaymentType === 'Parcelado'}
+                    onChange={() => setSofiaPaymentType('Parcelado')}
                     className="sr-only"
                   />
-                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${sofiaPaymentType === 'DINHEIRO' ? 'border-emerald-500 bg-emerald-500' : 'border-slate-300'}`}>
-                    {sofiaPaymentType === 'DINHEIRO' && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${sofiaPaymentType === 'Parcelado' ? 'border-emerald-500 bg-emerald-500' : 'border-slate-300'}`}>
+                    {sofiaPaymentType === 'Parcelado' && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
                   </div>
                   <div>
-                    <span className="text-xs font-bold block">Pago em Dinheiro</span>
-                    <span className="text-[10px] text-slate-400 block font-medium">Recebimento em dinheiro físico / depósito</span>
+                    <span className="text-xs font-bold block">Parcelado</span>
+                    <span className="text-[10px] text-slate-400 block font-medium">Pagamento parcelado no cartão ou crediário</span>
                   </div>
                 </label>
               </div>
@@ -5102,7 +5104,7 @@ export default function App() {
 
                     await handleQuickStatusUpdate(orderId, ext.newStatus, { 
                       ...ext.extra, 
-                      tipoRecebimento: payType 
+                      formaPagamento: payType 
                     });
                   }}
                   className="flex-1 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs py-2.5 px-4 rounded-full font-bold transition text-center cursor-pointer"
@@ -5173,7 +5175,7 @@ export default function App() {
                 'Status': o.status === 'PENDING' ? 'Pendente' :
                           o.status === 'DELIVERED' ? 'Entregue' :
                           o.status === 'CANCELLED' ? 'Cancelado' : o.status,
-                'Tipo Recebimento': o.tipoRecebimento || 'N/A'
+                'Forma Pagamento': o.formaPagamento
               }));
 
               const ws = XLSX.utils.json_to_sheet(exportData);
@@ -5274,10 +5276,10 @@ export default function App() {
                     <div className="flex flex-wrap gap-1.5">
                       {[
                         { id: 'ALL', label: 'Todos' },
-                        { id: 'SOFIA_HOME_DECOR', label: 'Sofia' },
                         { id: 'MICHAEL', label: 'Michael' },
                         { id: 'FRANK', label: 'Frank' },
-                        { id: 'OUTROS', label: 'Outros' }
+                        { id: 'OUTROS', label: 'Outros' },
+                        { id: 'SOFIA_HOME_DECOR', label: 'Sofia' }
                       ].map(sup => (
                         <button
                           key={sup.id}

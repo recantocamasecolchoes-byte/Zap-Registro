@@ -9,7 +9,7 @@ export interface Pedido {
   produto: string;
   cor: string;
   quantidade: number;
-  formaPagamento: string;
+  formaPagamento: 'À Vista' | 'Parcelado';
   valorTotal: number;
   comissao: number;
   status: 'PENDING' | 'RESCHEDULED' | 'DELIVERED_UNPAID' | 'DELIVERED' | 'CANCELLED';
@@ -20,7 +20,6 @@ export interface Pedido {
   city?: string;
   state?: string;
   supplier?: 'SOFIA_HOME_DECOR' | 'MICHAEL' | 'FRANK' | 'OUTROS';
-  tipoRecebimento?: 'TRAFEGO' | 'DINHEIRO';
   userId?: string;
   createdBy?: string;
   updatedBy?: string;
